@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.env
+
+# Virtual environments
+venv/
+venv311/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.env
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Docker
+*.pid
+*.seed
+*.pid.lock
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Coverage/test
+htmlcov/
+.tox/
+.coverage
+.pytest_cache/

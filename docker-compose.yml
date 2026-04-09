@@ -1,0 +1,45 @@
+version: "3.9"
+services:
+  probe_compensation:
+    build: ./microservices/probe_compensation
+    container_name: probe_compensation
+    ports:
+      - "8080:8080"
+    networks:
+    - metrology_net
+    volumes:
+      - ./microservices/probe_compensation:/app   # 👈 Mount source code
+    command: uvicorn app:app --host 0.0.0.0 --port 8080 --reload
+
+  alignment:
+    build: ./microservices/alignment
+    container_name: alignment
+    ports:
+      - "8081:8081"
+    networks:
+    - metrology_net
+    volumes:
+      - ./microservices/alignment:/app            # 👈 Mount source code
+    command: uvicorn app:app --host 0.0.0.0 --port 8081 --reload
+
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    ports:
+      - "8501:8501"
+    networks:
+    - metrology_net
+    volumes:
+      - ./dashboard:/app   
+      - ./simulation:/app/simulation   # 👈 mount simulation                       # 👈 Mount source code
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+    depends_on:
+      - probe_compensation
+      - alignment
+    environment:
+      - PYTHONPATH=/app
+
+networks:
+  metrology_net:
+    driver: bridge
+
