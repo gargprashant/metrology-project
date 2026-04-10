@@ -39,6 +39,33 @@ services:
     environment:
       - PYTHONPATH=/app
 
+  gdt_evaluation:
+    build: ./microservices/gdt_evaluation
+    container_name: gdt_evaluation
+    ports:
+      - "8083:8083"
+    networks:
+      - metrology_net
+    volumes:
+      - ./microservices/gdt_evaluation:/app
+    command: uvicorn app:app --host 0.0.0.0 --port 8083
+    environment:
+      - PYTHONPATH=/app
+  
+  reporting:
+    build: ./microservices/reporting
+    container_name: reporting
+    ports:
+      - "8084:8084"
+    networks:
+      - metrology_net
+    volumes:
+      - ./microservices/reporting:/app
+    command: uvicorn app:app --host 0.0.0.0 --port 8084
+    environment:
+      - PYTHONPATH=/app
+
+
 networks:
   metrology_net:
     driver: bridge

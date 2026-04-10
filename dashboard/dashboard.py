@@ -11,6 +11,27 @@ import json
 
 st.title("CMM Probe Compensation + Alignment Dashboard")
 
+def call_gdt_evaluation(aligned_points, nominal_features, tolerances):
+     # Ensure everything is JSON‑safe
+    if isinstance(aligned_points, np.ndarray):
+        aligned_points = aligned_points.tolist()
+
+    clean_nominal = {}
+    for k, v in nominal_features.items():
+        if isinstance(v, np.ndarray):
+            clean_nominal[k] = v.tolist()
+        else:
+            clean_nominal[k] = v
+
+    payload = {
+        "alignedPoints": aligned_points,
+        "nominalFeatures": clean_nominal,
+        "tolerances": tolerances
+    }
+
+    resp = requests.post("http://gdt_evaluation:8083/evaluate", json=payload, timeout=60)
+    return resp.json()["evaluationResults"]
+
 if st.button("Run Full Pipeline"):
     # Step 1: Generate noisy points
     nominal = feature_generator.generate_cylinder()
@@ -33,9 +54,19 @@ if st.button("Run Full Pipeline"):
     result2 = resp2.json()
     aligned = np.array([[p["x"], p["y"], p["z"]] for p in result2["alignedPoints"]])
 
+
     # Display metrics
     st.write(f"ICP Fitness: {result2['fitness']:.4f}")
     st.write(f"ICP RMSE: {result2['rmse']:.4f}")
+
+    # Call Microservice 3 (GD&T Evaluation)
+    gdt_results = call_gdt_evaluation(
+        aligned,
+        {"cylinder": nominal},
+        {"flatness": 0.1, "position": 0.1, "cylindricity": 0.1}
+    )
+    st.write("GD&T Evaluation Results:")
+    st.json(gdt_results)
 
     # Step 4: Plot noisy, compensated, aligned, and nominal points
     fig = go.Figure()
