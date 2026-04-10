@@ -1,78 +1,115 @@
-# microservices/alignment/app.py
-from fastapi import FastAPI, Request   
-from pydantic import BaseModel
-import numpy as np
-import open3d as o3d
+"""
+Alignment Service (Event-Driven)
+
+Subscribes to: feature-compensated (pulls from alignment-sub)
+Reads from:    compensated/ blob container
+Writes to:     aligned/ blob container (triggers feature-aligned event)
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+import threading
 import logging
 import time
 
+import numpy as np
+import open3d as o3d
+
+from shared.azure_clients import read_blob, write_blob, poll_and_process
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("alignment-service")
+logger = logging.getLogger("alignment")
 
-class Point(BaseModel):
-    x: float
-    y: float
-    z: float
+# ---------- Core Logic ----------
 
-app = FastAPI()
+def align_points(compensated_points: list, nominal_points: list) -> dict:
+    """Align compensated points to nominal geometry using ICP."""
+    compensated = np.array([[p["x"], p["y"], p["z"]] for p in compensated_points])
+    nominal = np.array([[p["x"], p["y"], p["z"]] for p in nominal_points])
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
+    src = o3d.geometry.PointCloud()
+    src.points = o3d.utility.Vector3dVector(compensated)
+
+    tgt = o3d.geometry.PointCloud()
+    tgt.points = o3d.utility.Vector3dVector(nominal)
+
+    src = src.voxel_down_sample(voxel_size=0.5)
+    tgt = tgt.voxel_down_sample(voxel_size=0.5)
+
     start = time.time()
-    response = await call_next(request)
-    duration = time.time() - start
-    logger.info(f"{request.method} {request.url} status={response.status_code} duration={duration:.3f}s")
-    return response
+    threshold = 2.0
+    trans_init = np.eye(4)
+    criteria = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
+    reg_p2p = o3d.pipelines.registration.registration_icp(
+        src, tgt, threshold, trans_init,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        criteria,
+    )
+    logger.info(f"ICP took {time.time() - start:.2f}s, fitness={reg_p2p.fitness:.4f}, rmse={reg_p2p.inlier_rmse:.4f}")
 
-class AlignmentRequest(BaseModel):
-    compensatedPoints: list[Point]
-    nominalPoints: list[Point]
+    aligned_src = src.transform(reg_p2p.transformation)
+    aligned_points = np.asarray(aligned_src.points)
 
-@app.post("/alignPoints")
-def align_points(req: AlignmentRequest):
-    try:
-        logger.info(f"Received alignment request with {len(req.compensatedPoints)} compensated points and {len(req.nominalPoints)} nominal points")
-        compensated = np.array([[p.x, p.y, p.z] for p in req.compensatedPoints])
-        nominal = np.array([[p.x, p.y, p.z] for p in req.nominalPoints])
+    return {
+        "transformationMatrix": reg_p2p.transformation.tolist(),
+        "fitness": reg_p2p.fitness,
+        "rmse": reg_p2p.inlier_rmse,
+        "alignedPoints": [
+            {"x": float(x), "y": float(y), "z": float(z)}
+            for x, y, z in aligned_points
+        ],
+    }
 
-        src = o3d.geometry.PointCloud()
-        src.points = o3d.utility.Vector3dVector(compensated)
+# ---------- Event Handler ----------
 
-        tgt = o3d.geometry.PointCloud()
-        tgt.points = o3d.utility.Vector3dVector(nominal)
+def handle_event(event_data: dict):
+    """Process a feature-compensated event."""
+    subject = event_data.get("subject", "")
+    blob_name = subject.split("/blobs/", 1)[-1] if "/blobs/" in subject else event_data.get("blob_name", "")
 
-        src = src.voxel_down_sample(voxel_size=0.5)
-        tgt = tgt.voxel_down_sample(voxel_size=0.5)
+    logger.info(f"Processing compensated blob: compensated/{blob_name}")
 
-        logger.info("Starting ICP alignment...")
-        
-        start = time.time()
+    # Read compensated data
+    comp_data = read_blob("compensated", blob_name)
 
-        threshold = 2.0
-        trans_init = np.eye(4)
-        criteria = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
-        reg_p2p = o3d.pipelines.registration.registration_icp(
-            src, tgt, threshold, trans_init,
-            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            criteria
-        )
+    # The compensated blob includes nominal points passed through from the raw scan
+    nominal_points = comp_data.get("nominalPoints", [])
+    if not nominal_points:
+        logger.error(f"No nominal points found in compensated/{blob_name}, skipping")
+        return
 
-        logger.info(f"ICP took {time.time() - start:.2f}s")
+    result = align_points(comp_data["compensatedPoints"], nominal_points)
 
+    # Build output
+    output = {
+        "cmmId": comp_data["cmmId"],
+        "alignedPoints": result["alignedPoints"],
+        "transformationMatrix": result["transformationMatrix"],
+        "fitness": result["fitness"],
+        "rmse": result["rmse"],
+        "sourceBlob": f"compensated/{blob_name}",
+    }
 
-        aligned_src = src.transform(reg_p2p.transformation)
-        aligned_points = np.asarray(aligned_src.points)
-        logger.info(f"ICP completed with fitness={reg_p2p.fitness:.4f} and rmse={reg_p2p.inlier_rmse:.4f}")
+    # Write to aligned/ container (triggers feature-aligned event)
+    write_blob("aligned", blob_name, output)
+    logger.info(f"Alignment complete for {blob_name}")
 
-        return {
-            "transformationMatrix": reg_p2p.transformation.tolist(),
-            "fitness": reg_p2p.fitness,
-            "rmse": reg_p2p.inlier_rmse,
-            "alignedPoints": [
-                {"x": float(x), "y": float(y), "z": float(z)} for x, y, z in aligned_points
-            ]
-        }
-    except Exception as e:
-        logger.error(f"Alignment failed: {e}")
-        return {"error": str(e)}
+# ---------- FastAPI App with Background Polling ----------
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    thread = threading.Thread(target=poll_and_process, args=(handle_event,), daemon=True)
+    thread.start()
+    logger.info("Event polling started")
+    yield
+    logger.info("Shutting down")
+
+app = FastAPI(title="Alignment Service", lifespan=lifespan)
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "service": "alignment"}

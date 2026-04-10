@@ -1,26 +1,77 @@
 version: "3.9"
+
 services:
   probe_compensation:
-    build: ./microservices/probe_compensation
+    build:
+      context: ./microservices
+      dockerfile: probe_compensation/Dockerfile
     container_name: probe_compensation
     ports:
       - "8080:8080"
     networks:
-    - metrology_net
-    volumes:
-      - ./microservices/probe_compensation:/app   # 👈 Mount source code
-    command: uvicorn app:app --host 0.0.0.0 --port 8080 --reload
+      - metrology_net
+    environment:
+      - EVENT_GRID_ENDPOINT=${EVENT_GRID_ENDPOINT}
+      - STORAGE_ACCOUNT_URL=${STORAGE_ACCOUNT_URL}
+      - TOPIC_NAME=feature-scanned
+      - SUBSCRIPTION_NAME=probe-compensation-sub
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
 
   alignment:
-    build: ./microservices/alignment
+    build:
+      context: ./microservices
+      dockerfile: alignment/Dockerfile
     container_name: alignment
     ports:
-      - "8081:8081"
+      - "8081:8080"
     networks:
-    - metrology_net
-    volumes:
-      - ./microservices/alignment:/app            # 👈 Mount source code
-    command: uvicorn app:app --host 0.0.0.0 --port 8081 --reload
+      - metrology_net
+    environment:
+      - EVENT_GRID_ENDPOINT=${EVENT_GRID_ENDPOINT}
+      - STORAGE_ACCOUNT_URL=${STORAGE_ACCOUNT_URL}
+      - TOPIC_NAME=feature-compensated
+      - SUBSCRIPTION_NAME=alignment-sub
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+
+  gdt_evaluation:
+    build:
+      context: ./microservices
+      dockerfile: gdt_evaluation/Dockerfile
+    container_name: gdt_evaluation
+    ports:
+      - "8083:8080"
+    networks:
+      - metrology_net
+    environment:
+      - EVENT_GRID_ENDPOINT=${EVENT_GRID_ENDPOINT}
+      - STORAGE_ACCOUNT_URL=${STORAGE_ACCOUNT_URL}
+      - TOPIC_NAME=feature-aligned
+      - SUBSCRIPTION_NAME=gdt-evaluation-sub
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+
+  reporting:
+    build:
+      context: ./microservices
+      dockerfile: reporting/Dockerfile
+    container_name: reporting
+    ports:
+      - "8084:8080"
+    networks:
+      - metrology_net
+    environment:
+      - EVENT_GRID_ENDPOINT=${EVENT_GRID_ENDPOINT}
+      - STORAGE_ACCOUNT_URL=${STORAGE_ACCOUNT_URL}
+      - TOPIC_NAME=feature-evaluated
+      - SUBSCRIPTION_NAME=reporting-sub
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
 
   dashboard:
     build: ./dashboard
@@ -28,18 +79,17 @@ services:
     ports:
       - "8501:8501"
     networks:
-    - metrology_net
+      - metrology_net
     volumes:
-      - ./dashboard:/app   
-      - ./simulation:/app/simulation   # 👈 mount simulation                       # 👈 Mount source code
+      - ./simulation:/app/simulation
     command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
-    depends_on:
-      - probe_compensation
-      - alignment
     environment:
       - PYTHONPATH=/app
+      - STORAGE_ACCOUNT_URL=${STORAGE_ACCOUNT_URL}
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
 
 networks:
   metrology_net:
     driver: bridge
-
