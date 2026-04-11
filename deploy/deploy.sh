@@ -88,13 +88,20 @@ for SERVICE in probe_compensation alignment gdt_evaluation reporting; do
     --target-port 8080 \
     --ingress internal \
     --min-replicas 0 \
-    --max-replicas 3 \
+    --max-replicas 20 \
     --env-vars \
       EVENT_GRID_ENDPOINT="$EVENT_GRID_ENDPOINT" \
       STORAGE_ACCOUNT_URL="$STORAGE_ACCOUNT_URL" \
       TOPIC_NAME="${TOPICS[$SERVICE]}" \
       SUBSCRIPTION_NAME="${SUBS[$SERVICE]}" \
-    --system-assigned
+    --system-assigned \
+    --scale-rule-name "eventgrid-queue" \
+    --scale-rule-type "azure-event-grid" \
+    --scale-rule-metadata \
+      "subscriptionName=${SUBS[$SERVICE]}" \
+      "topicName=${TOPICS[$SERVICE]}" \
+      "eventGridNamespaceEndpoint=$EVENT_GRID_ENDPOINT" \
+    --scale-rule-auth "connection=managed-identity"
 done
 
 # Deploy dashboard

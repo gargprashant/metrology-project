@@ -19,7 +19,7 @@ import time
 import numpy as np
 import open3d as o3d
 
-from shared.azure_clients import read_blob, write_blob, poll_and_process
+from shared.azure_clients import read_blob, write_blob, poll_and_process, extract_blob_name
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alignment")
@@ -66,10 +66,9 @@ def align_points(compensated_points: list, nominal_points: list) -> dict:
 
 # ---------- Event Handler ----------
 
-def handle_event(event_data: dict):
+def handle_event(event):
     """Process a feature-compensated event."""
-    subject = event_data.get("subject", "")
-    blob_name = subject.split("/blobs/", 1)[-1] if "/blobs/" in subject else event_data.get("blob_name", "")
+    blob_name = extract_blob_name(event)
 
     logger.info(f"Processing compensated blob: compensated/{blob_name}")
 

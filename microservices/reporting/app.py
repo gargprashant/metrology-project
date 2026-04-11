@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from shared.azure_clients import read_blob, write_blob, poll_and_process
+from shared.azure_clients import read_blob, write_blob, poll_and_process, extract_blob_name
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("reporting")
@@ -68,10 +68,9 @@ def generate_report(evaluation_data: dict) -> dict:
 
 # ---------- Event Handler ----------
 
-def handle_event(event_data: dict):
+def handle_event(event):
     """Process a feature-evaluated event."""
-    subject = event_data.get("subject", "")
-    blob_name = subject.split("/blobs/", 1)[-1] if "/blobs/" in subject else event_data.get("blob_name", "")
+    blob_name = extract_blob_name(event)
 
     logger.info(f"Processing evaluation results: results/{blob_name}")
 
@@ -81,9 +80,9 @@ def handle_event(event_data: dict):
     # Generate report
     report = generate_report(eval_data)
 
-    # Write report to Slogs/ container
+    # Write report to reports/ container
     report_blob_name = f"report_{blob_name}"
-    write_blob("Slogs", report_blob_name, report)
+    write_blob("reports", report_blob_name, report)
 
     logger.info(
         f"Report generated for {blob_name}: "

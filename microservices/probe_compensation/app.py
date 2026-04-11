@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 import threading
 import logging
 
-from shared.azure_clients import read_blob, write_blob, poll_and_process
+from shared.azure_clients import read_blob, write_blob, poll_and_process, extract_blob_name
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("probe-compensation")
@@ -42,12 +42,9 @@ def compensate_points(cmm_id: str, probe_diameter: float, points: list) -> list:
 
 # ---------- Event Handler ----------
 
-def handle_event(event_data: dict):
+def handle_event(event):
     """Process a feature-scanned event."""
-    subject = event_data.get("subject", "")
-    # Extract blob name from the subject path
-    # Subject format: /blobServices/default/containers/rawscan/blobs/<blob_name>
-    blob_name = subject.split("/blobs/", 1)[-1] if "/blobs/" in subject else event_data.get("blob_name", "")
+    blob_name = extract_blob_name(event)
 
     logger.info(f"Processing raw scan blob: rawscan/{blob_name}")
 

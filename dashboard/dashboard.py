@@ -120,7 +120,7 @@ if st.button("Check Results"):
                 ("compensated", blob_name, "Probe Compensation"),
                 ("aligned", blob_name, "Alignment"),
                 ("results", blob_name, "GD&T Evaluation"),
-                ("Slogs", report_blob, "Report"),
+                ("reports", report_blob, "Report"),
             ]
 
             progress = st.empty()
@@ -132,7 +132,7 @@ if st.button("Check Results"):
                     break
 
         # If report is ready, display it
-        report = read_blob("Slogs", report_blob)
+        report = read_blob("reports", report_blob)
         if report:
             st.subheader("Pipeline Complete")
 

@@ -5,9 +5,8 @@ services:
     build:
       context: ./microservices
       dockerfile: probe_compensation/Dockerfile
-    container_name: probe_compensation
     ports:
-      - "8080:8080"
+      - "8080"
     networks:
       - metrology_net
     environment:
@@ -23,9 +22,8 @@ services:
     build:
       context: ./microservices
       dockerfile: alignment/Dockerfile
-    container_name: alignment
     ports:
-      - "8081:8080"
+      - "8080"
     networks:
       - metrology_net
     environment:

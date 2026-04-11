@@ -20,7 +20,7 @@ import logging
 import numpy as np
 from scipy.optimize import least_squares
 
-from shared.azure_clients import read_blob, write_blob, poll_and_process
+from shared.azure_clients import read_blob, write_blob, poll_and_process, extract_blob_name
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gdt-evaluation")
@@ -100,10 +100,9 @@ def run_evaluation(aligned_points: list, tolerances: dict = None) -> dict:
 
 # ---------- Event Handler ----------
 
-def handle_event(event_data: dict):
+def handle_event(event):
     """Process a feature-aligned event."""
-    subject = event_data.get("subject", "")
-    blob_name = subject.split("/blobs/", 1)[-1] if "/blobs/" in subject else event_data.get("blob_name", "")
+    blob_name = extract_blob_name(event)
 
     logger.info(f"Processing aligned blob: aligned/{blob_name}")
 
