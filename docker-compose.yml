@@ -1,10 +1,9 @@
-version: "3.9"
-
 services:
   probe_compensation:
     build:
       context: ./microservices
       dockerfile: probe_compensation/Dockerfile
+    init: true
     ports:
       - "8080"
     networks:
@@ -22,6 +21,7 @@ services:
     build:
       context: ./microservices
       dockerfile: alignment/Dockerfile
+    init: true
     ports:
       - "8080"
     networks:
@@ -39,9 +39,9 @@ services:
     build:
       context: ./microservices
       dockerfile: gdt_evaluation/Dockerfile
-    container_name: gdt_evaluation
+    init: true
     ports:
-      - "8083:8080"
+      - "8080"
     networks:
       - metrology_net
     environment:
@@ -57,9 +57,9 @@ services:
     build:
       context: ./microservices
       dockerfile: reporting/Dockerfile
-    container_name: reporting
+    init: true
     ports:
-      - "8084:8080"
+      - "8080"
     networks:
       - metrology_net
     environment:

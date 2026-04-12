@@ -2,9 +2,9 @@
 Live Results Grid — 10 CMMs x 10 features, fully event-driven.
 
 1. Background thread drip-feeds scans (random CMM, random order).
-2. Another background thread subscribes to feature-reported events.
-3. When a report event arrives → read report → show badge + plot instantly.
-4. No polling. Pure event-driven display.
+2. Event listener subscribes to feature-reported events via Event Grid.
+3. Results stored in session_state — survive button clicks/reruns.
+4. Click "3D" button on any cell to open interactive fullscreen dialog.
 
 Usage:
     streamlit run simulation/live_grid.py --server.port 8503
@@ -18,7 +18,14 @@ import time
 import random
 import threading
 import queue
+import logging
 from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger(__name__)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 import streamlit as st
 import matplotlib
@@ -43,10 +50,7 @@ STORAGE_ACCOUNT_URL = os.environ.get(
     "STORAGE_ACCOUNT_URL",
     "https://metrologyprojectstorage.blob.core.windows.net",
 )
-EVENT_GRID_ENDPOINT = os.environ.get(
-    "EVENT_GRID_ENDPOINT",
-    "",
-)
+EVENT_GRID_ENDPOINT = os.environ.get("EVENT_GRID_ENDPOINT", "")
 
 credential = ClientSecretCredential(
     tenant_id=os.environ["AZURE_TENANT_ID"],
@@ -55,7 +59,6 @@ credential = ClientSecretCredential(
 )
 blob_service = BlobServiceClient(account_url=STORAGE_ACCOUNT_URL, credential=credential)
 
-# Event Grid consumer for reports
 event_consumer = EventGridConsumerClient(
     endpoint=EVENT_GRID_ENDPOINT,
     credential=credential,
@@ -63,8 +66,10 @@ event_consumer = EventGridConsumerClient(
     subscription="dashboard-sub",
 )
 
-# Queue: event thread pushes report blob names, main thread consumes
-report_queue = queue.Queue()
+# These must NOT be module-level — Streamlit re-executes the script on each
+# rerun, which would create fresh objects while background threads still
+# reference the old ones.  We lazily initialise them once and stash them in
+# st.session_state so every rerun and every thread sees the *same* instance.
 
 
 # ---------- Azure Helpers ----------
@@ -96,7 +101,6 @@ def clear_all_blobs():
 
 
 def extract_blob_name(event):
-    """Extract blob name from BlobCreated CloudEvent subject."""
     subject = getattr(event, "subject", "") or ""
     if "/blobs/" in subject:
         return subject.split("/blobs/", 1)[-1]
@@ -110,21 +114,25 @@ def extract_blob_name(event):
     return ""
 
 
-# ---------- Event Subscriber (background thread) ----------
+# ---------- Event Listener (background thread) ----------
 
-def event_listener():
-    """Pull events from feature-reported subscription. Push blob names to queue."""
+def event_listener(rq, signal):
+    log.info("event_listener: STARTED")
     while True:
         try:
-            details_list = event_consumer.receive(max_events=5, max_wait_time=10)
+            details_list = event_consumer.receive(max_events=10, max_wait_time=10)
+            tokens = []
             for detail in details_list:
-                event = detail.event
-                lock_token = detail.broker_properties.lock_token
-                blob_name = extract_blob_name(event)
+                blob_name = extract_blob_name(detail.event)
                 if blob_name:
-                    report_queue.put(blob_name)
-                event_consumer.acknowledge(lock_tokens=[lock_token])
-        except Exception:
+                    rq.put(blob_name)
+                    log.info(f"event_listener: got {blob_name}")
+                tokens.append(detail.broker_properties.lock_token)
+            if tokens:
+                event_consumer.acknowledge(lock_tokens=tokens)
+                signal.set()  # wake up UI loop
+        except Exception as e:
+            log.error(f"event_listener: error: {e}")
             time.sleep(2)
 
 
@@ -172,8 +180,8 @@ def make_interactive_3d(nominal_pts, actual_pts, title=""):
             name="Actual",
         ))
     fig.update_layout(
-        title=dict(text=title, font=dict(size=13)),
-        height=500, margin=dict(l=0, r=0, t=35, b=0),
+        title=dict(text=title, font=dict(size=14)),
+        height=600, margin=dict(l=0, r=0, t=40, b=0),
         legend=dict(x=0, y=1),
         scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
     )
@@ -181,8 +189,6 @@ def make_interactive_3d(nominal_pts, actual_pts, title=""):
 
 
 # ---------- Upload (background thread) ----------
-
-upload_state = {"count": 0, "done": False}
 
 
 def upload_one(cmm_idx, feat_idx, shape, sigma):
@@ -207,9 +213,10 @@ def upload_one(cmm_idx, feat_idx, shape, sigma):
     )
 
 
-def drip_feed():
-    upload_state["count"] = 0
-    upload_state["done"] = False
+def drip_feed(us, signal):
+    log.info("drip_feed: STARTED")
+    us["count"] = 0
+    us["done"] = False
 
     jobs = []
     for ci in range(NUM_CMMS):
@@ -221,22 +228,158 @@ def drip_feed():
     for ci, fi, shape, sigma in jobs:
         try:
             upload_one(ci, fi, shape, sigma)
-            upload_state["count"] += 1
-        except Exception:
-            pass
-        time.sleep(random.uniform(0.2, 1.0))
+            us["count"] += 1
+            signal.set()  # wake UI — upload count changed
+            log.info(f"drip_feed: uploaded {us['count']}/100")
+        except Exception as e:
+            log.error(f"drip_feed: upload error: {e}")
+        time.sleep(random.uniform(0.05, 0.3))
 
-    upload_state["done"] = True
+    us["done"] = True
+    signal.set()
+    log.info("drip_feed: ALL DONE")
 
 
 def parse_key(blob_name):
-    """Parse report_CMM_XX_FYY.json or CMM_XX_FYY.json -> (cmm_idx, feat_idx)."""
     try:
         name = blob_name.replace("report_", "").replace(".json", "")
         parts = name.split("_")
         return (int(parts[1]) - 1, int(parts[2][1:]) - 1)
     except Exception:
         return None
+
+
+# ---------- Session State Init ----------
+
+if "phase" not in st.session_state:
+    st.session_state.phase = "idle"          # idle | running | done
+    st.session_state.results = {}            # (ci, fi) -> report dict
+    st.session_state.images = {}             # (ci, fi) -> PNG bytes
+    st.session_state.point_data = {}         # (ci, fi) -> (nom, act)
+    st.session_state.counters = {"pass": 0, "fail": 0}
+    st.session_state.threads_started = False
+    st.session_state.report_queue = queue.Queue()
+    st.session_state.upload_state = {"count": 0, "done": False}
+    st.session_state.image_pool = ThreadPoolExecutor(max_workers=10)
+    st.session_state.data_ready = threading.Event()
+
+# Convenience aliases — same object on every rerun, threads see the same instance
+report_queue = st.session_state.report_queue
+upload_state = st.session_state.upload_state
+image_pool = st.session_state.image_pool
+data_ready = st.session_state.data_ready
+
+
+# ---------- Process new events from queue ----------
+
+def _fetch_and_render(ci, fi, blob_name, results, img_store, pt_store, counters, signal):
+    """Pool worker: fetch report + point data + render static image."""
+    key = (ci, fi)
+    # Fetch report
+    report = read_blob("reports", blob_name)
+    if not report:
+        return
+    results[key] = report
+
+    # Update counters
+    p = report.get("summary", {}).get("passed", 0)
+    t = report.get("summary", {}).get("total_checks", 0)
+    if p == t:
+        counters["pass"] += 1
+    else:
+        counters["fail"] += 1
+    signal.set()  # wake UI — report ready
+
+    # Fetch point data + render image
+    cmm_id = f"CMM_{str(ci+1).zfill(2)}"
+    scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
+    raw = read_blob("rawscan", scan_name)
+    aligned = read_blob("aligned", scan_name)
+    nom = raw.get("nominalPoints", []) if raw else []
+    act = aligned.get("alignedPoints", []) if aligned else []
+    pt_store[key] = (nom, act)
+    if nom or act:
+        img_store[key] = make_static_3d(nom, act)
+        signal.set()  # wake UI — image ready
+
+
+def drain_queue():
+    """Pull all pending events — zero HTTP calls, just submit to pool."""
+    new_count = 0
+    while not report_queue.empty():
+        try:
+            blob_name = report_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        key = parse_key(blob_name)
+        if key is None or key in st.session_state.results:
+            continue
+        ci, fi = key
+
+        # Mark as pending immediately (so counter updates on next rerun)
+        st.session_state.results[key] = "pending"
+
+        # All HTTP calls + rendering happen in pool thread
+        image_pool.submit(
+            _fetch_and_render, ci, fi, blob_name,
+            st.session_state.results, st.session_state.images,
+            st.session_state.point_data, st.session_state.counters,
+            data_ready,
+        )
+        new_count += 1
+
+    return new_count
+
+
+
+
+# ---------- Fullscreen 3D Dialog ----------
+
+@st.dialog("Interactive 3D View", width="large")
+def show_3d_dialog(ci, fi):
+    cmm_label = f"CMM_{str(ci+1).zfill(2)}"
+    feat_label = f"F{str(fi+1).zfill(2)}"
+
+    nom, act = st.session_state.point_data.get((ci, fi), ([], []))
+    # Try fetching on demand if missing
+    if not nom and not act:
+        scan_name = f"{cmm_label}_{feat_label}.json"
+        raw = read_blob("rawscan", scan_name)
+        aligned = read_blob("aligned", scan_name)
+        nom = raw.get("nominalPoints", []) if raw else []
+        act = aligned.get("alignedPoints", []) if aligned else []
+        if nom or act:
+            st.session_state.point_data[(ci, fi)] = (nom, act)
+    if nom or act:
+        st.plotly_chart(
+            make_interactive_3d(nom, act, f"{cmm_label} / {feat_label}"),
+            width="stretch",
+        )
+    else:
+        st.warning("No point data available.")
+
+    report = st.session_state.results.get((ci, fi))
+    if report:
+        status = report.get("summary", {}).get("overall_status", "?")
+        passed = report.get("summary", {}).get("passed", 0)
+        total_checks = report.get("summary", {}).get("total_checks", 0)
+        color = "#4CAF50" if status == "PASS" else "#F44336"
+        st.markdown(
+            f'<div style="background:{color};color:white;padding:8px 12px;'
+            f'border-radius:5px;text-align:center;font-weight:bold;font-size:16px;'
+            f'margin-bottom:8px;">'
+            f'{status} {passed}/{total_checks}</div>',
+            unsafe_allow_html=True,
+        )
+        for d in report.get("details", []):
+            s = "PASS" if d.get("Status") == "PASS" else "FAIL"
+            icon = "+" if s == "PASS" else "-"
+            st.markdown(f"  {icon} **{d.get('Feature','?')}**: {d.get('Value',0):.6f} / {d.get('Tolerance',0)} [{s}]")
+        fitness = report.get("fitness")
+        rmse = report.get("rmse")
+        if fitness is not None:
+            st.markdown(f"  **Fitness**: {fitness:.4f}  |  **RMSE**: {rmse:.4f}")
 
 
 # ========== Streamlit UI ==========
@@ -250,15 +393,10 @@ with col_start:
 with col_stop:
     stop_clicked = st.button("Stop", type="secondary", use_container_width=True)
 
-if stop_clicked:
-    with st.spinner("Clearing all blob data..."):
-        deleted = clear_all_blobs()
-    st.success(f"Cleared {deleted} blobs. Ready for a fresh run.")
-    st.stop()
-
+# Summary bar (updatable without full rerun)
 summary_bar = st.empty()
-upload_bar = st.empty()
 
+# Column headers
 hcols = st.columns([1] + [1] * FEATURES_PER_CMM)
 with hcols[0]:
     st.markdown("**CMM**")
@@ -267,142 +405,179 @@ for f in range(FEATURES_PER_CMM):
         st.markdown(f"**F{f+1:02d}**")
 st.divider()
 
-grid_status = {}
-grid_plot = {}
+# Create 100 empty placeholders — one per cell. These persist and can be
+# individually updated without touching other cells.
+cells = {}
 for ci in range(NUM_CMMS):
     cols = st.columns([1] + [1] * FEATURES_PER_CMM)
     with cols[0]:
         st.markdown(f"**CMM_{str(ci+1).zfill(2)}**")
     for fi in range(FEATURES_PER_CMM):
         with cols[fi + 1]:
-            grid_status[(ci, fi)] = st.empty()
-            grid_status[(ci, fi)].markdown(":gray[---]")
-            grid_plot[(ci, fi)] = st.empty()
+            cells[(ci, fi)] = st.empty()
 
-# Interactive 3D viewer
-st.divider()
-st.subheader("Interactive 3D Viewer")
-vcols = st.columns([1, 1, 4])
-with vcols[0]:
-    sel_cmm = st.selectbox("CMM", [f"CMM_{str(i+1).zfill(2)}" for i in range(NUM_CMMS)])
-with vcols[1]:
-    sel_feat = st.selectbox("Feature", [f"F{str(i+1).zfill(2)}" for i in range(FEATURES_PER_CMM)])
-viewer = st.empty()
 
-vblob = f"{sel_cmm}_{sel_feat}.json"
-vraw = read_blob("rawscan", vblob)
-valigned = read_blob("aligned", vblob)
-if vraw or valigned:
-    vnom = vraw.get("nominalPoints", []) if vraw else []
-    vact = valigned.get("alignedPoints", []) if valigned else []
-    viewer.plotly_chart(make_interactive_3d(vnom, vact, f"{sel_cmm} / {sel_feat}"), use_container_width=True)
-else:
-    viewer.info("No data yet.")
+def render_cell(placeholder, ci, fi):
+    """Render a single cell into its placeholder."""
+    key = (ci, fi)
+    report = st.session_state.results.get(key)
+    if not isinstance(report, dict):
+        if report == "pending":
+            placeholder.markdown(":orange[loading...]")
+        else:
+            placeholder.markdown(":gray[---]")
+        return
 
-if not start_clicked:
-    st.info("Press **Start** to begin.")
-    st.stop()
+    passed = report.get("summary", {}).get("passed", 0)
+    total_checks = report.get("summary", {}).get("total_checks", 0)
 
-# ---------- GO ----------
+    # Detail lines with per-check coloring
+    detail_html = ""
+    fitness = report.get("fitness")
+    rmse = report.get("rmse")
+    meta = []
+    if fitness is not None:
+        meta.append(f"fit={fitness:.3f}")
+    if rmse is not None:
+        meta.append(f"rmse={rmse:.3f}")
+    if meta:
+        detail_html += " | ".join(meta) + "<br>"
+    for d in report.get("details", []):
+        is_pass = d.get("Status") == "PASS"
+        if is_pass:
+            dc = "#1B8a1B"
+            bg = "#e8f5e9"
+            tag = "PASS"
+        else:
+            dc = "#c62828"
+            bg = "#ffebee"
+            tag = "FAIL"
+        detail_html += (
+            f'<div style="color:{dc};background:{bg};font-weight:bold;'
+            f'padding:2px 4px;margin:1px 0;border-radius:2px;font-size:10px;">'
+            f'{d.get("Feature","?")}: {d.get("Value",0):.4f}/{d.get("Tolerance",0)} '
+            f'[{tag}]</div>'
+        )
 
-upload_bar.markdown("**Cleaning previous data...**")
-clear_all_blobs()
+    all_pass = passed == total_checks
+    color = "#4CAF50" if all_pass else "#F44336"
+    failed = total_checks - passed
+    label = f"PASS {passed}/{total_checks}" if all_pass else f"FAIL {failed}/{total_checks}"
 
-# Start event listener (receives report events)
-threading.Thread(target=event_listener, daemon=True).start()
-
-# Start scan uploads (drip-feed)
-threading.Thread(target=drip_feed, daemon=True).start()
-
-total = NUM_CMMS * FEATURES_PER_CMM
-pass_count = 0
-fail_count = 0
-done_count = 0
-
-while True:
-    # Update upload counter
-    uc = upload_state["count"]
-    if upload_state["done"]:
-        upload_bar.markdown(f"**All {uc} scans uploaded.**")
-    else:
-        upload_bar.markdown(f"**CMMs scanning: {uc}/{total} uploaded...**")
-
-    # Drain the event queue — process all new report events
-    while not report_queue.empty():
-        try:
-            blob_name = report_queue.get_nowait()
-        except queue.Empty:
-            break
-
-        key = parse_key(blob_name)
-        if key is None:
-            continue
-        ci, fi = key
-
-        # Read the report blob
-        report = read_blob("reports", blob_name)
-        if not report:
-            continue
-
-        status = report.get("summary", {}).get("overall_status", "?")
-        passed = report.get("summary", {}).get("passed", 0)
-        total_checks = report.get("summary", {}).get("total_checks", 0)
-
-        lines = []
-        for d in report.get("details", []):
-            s = "P" if d.get("Status") == "PASS" else "F"
-            lines.append(f"{d.get('Feature','?')}: {d.get('Value',0):.4f}/{d.get('Tolerance',0)} [{s}]")
-        fitness = report.get("fitness")
-        rmse = report.get("rmse")
-        meta = []
-        if fitness is not None:
-            meta.append(f"fit={fitness:.3f}")
-        if rmse is not None:
-            meta.append(f"rmse={rmse:.3f}")
-        detail = " | ".join(meta) + "\n" + "\n".join(lines)
-
-        # Show result
-        color = "#4CAF50" if status == "PASS" else "#F44336"
-        grid_status[(ci, fi)].markdown(
+    img = st.session_state.images.get(key)
+    with placeholder.container():
+        st.markdown(
             f'<div style="background:{color};color:white;padding:6px 8px;'
             f'border-radius:5px;text-align:center;font-weight:bold;font-size:13px;'
             f'margin-bottom:4px;">'
-            f'{status} {passed}/{total_checks}</div>'
-            f'<div style="font-size:10px;line-height:1.4;white-space:pre;'
+            f'{label} ({passed}/{total_checks})</div>'
+            f'<div style="font-size:10px;line-height:1.4;'
             f'background:#f8f8f8;padding:4px;border-radius:3px;overflow:hidden;">'
-            f'{detail}</div>',
+            f'{detail_html}</div>',
             unsafe_allow_html=True,
         )
+        if img:
+            st.image(img, width="stretch")
 
-        # Show 3D plot
-        cmm_id = f"CMM_{str(ci+1).zfill(2)}"
-        scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
-        raw = read_blob("rawscan", scan_name)
-        aligned = read_blob("aligned", scan_name)
-        nom = raw.get("nominalPoints", []) if raw else []
-        act = aligned.get("alignedPoints", []) if aligned else []
-        if nom or act:
-            grid_plot[(ci, fi)].image(make_static_3d(nom, act), use_container_width=True)
 
-        if status == "PASS":
-            pass_count += 1
-        else:
-            fail_count += 1
-        done_count += 1
-
-        # Update summary immediately
+def update_summary():
+    total = NUM_CMMS * FEATURES_PER_CMM
+    pc = st.session_state.counters["pass"]
+    fc = st.session_state.counters["fail"]
+    done = pc + fc
+    uc = upload_state["count"]
+    if done >= total:
+        summary_bar.success(f"All {total} scans processed!  PASS: {pc}  |  FAIL: {fc}")
+    elif st.session_state.phase == "running":
+        upload_msg = f"All {uc} scans uploaded." if upload_state["done"] else f"CMMs scanning: {uc}/{total} uploaded..."
         summary_bar.markdown(
-            f"**Completed: {done_count}/{total}  |  "
-            f":green[PASS: {pass_count}]  |  :red[FAIL: {fail_count}]  |  "
-            f"Remaining: {total - done_count}  |  "
-            f"Uploaded: {upload_state['count']}/{total}**"
+            f"**Completed: {done}/{total}  |  "
+            f":green[PASS: {pc}]  |  :red[FAIL: {fc}]  |  "
+            f"Remaining: {total - done}  |  "
+            f"Uploaded: {uc}/{total}**\n\n{upload_msg}"
         )
+    elif st.session_state.phase == "idle":
+        summary_bar.info("Press **Start** to begin.")
 
-    if done_count >= total:
-        summary_bar.success(
-            f"All {total} scans processed!  PASS: {pass_count}  |  FAIL: {fail_count}"
-        )
-        break
 
-    # Small sleep — just to avoid busy-spinning, events arrive via queue
-    time.sleep(0.1)
+# ---------- Stop ----------
+if stop_clicked:
+    with st.spinner("Clearing all blob data..."):
+        deleted = clear_all_blobs()
+    st.session_state.phase = "idle"
+    st.session_state.results = {}
+    st.session_state.images = {}
+    st.session_state.point_data = {}
+    st.session_state.counters = {"pass": 0, "fail": 0}
+    st.session_state.threads_started = False
+    upload_state["count"] = 0
+    upload_state["done"] = False
+    for key, ph in cells.items():
+        ph.markdown(":gray[---]")
+    summary_bar.success(f"Cleared {deleted} blobs. Ready for a fresh run.")
+    st.stop()
+
+# ---------- Start ----------
+if start_clicked and st.session_state.phase == "idle":
+    with st.spinner("Cleaning previous data..."):
+        clear_all_blobs()
+    st.session_state.results = {}
+    st.session_state.images = {}
+    st.session_state.point_data = {}
+    st.session_state.counters = {"pass": 0, "fail": 0}
+    upload_state["count"] = 0
+    upload_state["done"] = False
+    st.session_state.threads_started = False
+    st.session_state.rendered = set()
+    for key, ph in cells.items():
+        ph.markdown(":gray[---]")
+    st.session_state.phase = "running"
+
+# ---------- Running: live update loop ----------
+if st.session_state.phase == "running":
+    if not st.session_state.threads_started:
+        log.info("PHASE running: starting background threads")
+        threading.Thread(target=event_listener, args=(report_queue, data_ready), daemon=True).start()
+        threading.Thread(target=drip_feed, args=(upload_state, data_ready), daemon=True).start()
+        st.session_state.threads_started = True
+
+    if "rendered" not in st.session_state:
+        st.session_state.rendered = set()
+
+    total = NUM_CMMS * FEATURES_PER_CMM
+
+    # Event-driven loop — sleeps until data_ready is signalled
+    while True:
+        # Block until a background thread signals new data (no CPU burn)
+        data_ready.wait(timeout=5)
+        data_ready.clear()
+
+        drain_queue()
+        update_summary()
+
+        # Update only cells that have new data
+        for key, ph in cells.items():
+            ci, fi = key
+            result = st.session_state.results.get(key)
+            img_ready = key in st.session_state.images
+            already = key in st.session_state.rendered
+
+            if isinstance(result, dict) and img_ready and not already:
+                render_cell(ph, ci, fi)
+                st.session_state.rendered.add(key)
+            elif isinstance(result, dict) and not img_ready and not already:
+                render_cell(ph, ci, fi)
+            elif result == "pending" and not already:
+                ph.markdown(":orange[loading...]")
+
+        done = st.session_state.counters["pass"] + st.session_state.counters["fail"]
+        if done >= total:
+            for key, ph in cells.items():
+                if key in st.session_state.images:
+                    render_cell(ph, key[0], key[1])
+            update_summary()
+            st.session_state.phase = "done"
+            break
+
+elif st.session_state.phase == "idle":
+    update_summary()
