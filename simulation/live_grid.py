@@ -33,7 +33,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-from azure.identity import ClientSecretCredential
+from azure.identity import DefaultAzureCredential, ClientSecretCredential
 from azure.eventgrid import EventGridConsumerClient
 from azure.storage.blob import BlobServiceClient
 
@@ -53,11 +53,15 @@ STORAGE_ACCOUNT_URL = os.environ.get(
 )
 EVENT_GRID_ENDPOINT = os.environ.get("EVENT_GRID_ENDPOINT", "")
 
-credential = ClientSecretCredential(
-    tenant_id=os.environ["AZURE_TENANT_ID"],
-    client_id=os.environ["AZURE_CLIENT_ID"],
-    client_secret=os.environ["AZURE_CLIENT_SECRET"],
-)
+# Use ClientSecretCredential locally (when env vars present), DefaultAzureCredential in cloud
+if os.environ.get("AZURE_CLIENT_SECRET"):
+    credential = ClientSecretCredential(
+        tenant_id=os.environ["AZURE_TENANT_ID"],
+        client_id=os.environ["AZURE_CLIENT_ID"],
+        client_secret=os.environ["AZURE_CLIENT_SECRET"],
+    )
+else:
+    credential = DefaultAzureCredential()
 blob_service = BlobServiceClient(account_url=STORAGE_ACCOUNT_URL, credential=credential)
 
 event_consumer = EventGridConsumerClient(

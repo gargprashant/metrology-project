@@ -28,22 +28,24 @@ logger = logging.getLogger("gdt-evaluation")
 # ---------- GD&T Evaluation Functions ----------
 
 def evaluate_flatness(points: np.ndarray) -> dict:
-    """Evaluate flatness by fitting a plane and measuring max deviation."""
+    """Evaluate flatness by fitting a plane and measuring RMS residual.
+    Uses std of signed distances — scales with noise, not shape size."""
     centroid = points.mean(axis=0)
     centered = points - centroid
     _, _, vh = np.linalg.svd(centered)
     normal = vh[-1]
-    distances = np.abs(centered @ normal)
+    distances = centered @ normal  # signed distances to best-fit plane
     return {
         "type": "flatness",
-        "value": float(distances.max() - distances.min()),
-        "max_deviation": float(distances.max()),
-        "mean_deviation": float(distances.mean()),
+        "value": float(np.std(distances)),
+        "max_deviation": float(np.abs(distances).max()),
+        "mean_deviation": float(np.abs(distances).mean()),
     }
 
 
 def evaluate_cylindricity(points: np.ndarray) -> dict:
-    """Evaluate cylindricity by fitting a cylinder axis and measuring radial deviation."""
+    """Evaluate cylindricity by fitting a cylinder axis and measuring radial deviation.
+    Uses std of radial residuals — scales with noise, not shape size."""
     centroid = points.mean(axis=0)
     centered = points - centroid
     _, _, vh = np.linalg.svd(centered)
@@ -53,11 +55,11 @@ def evaluate_cylindricity(points: np.ndarray) -> dict:
     projections = centered - np.outer(centered @ axis, axis)
     radii = np.linalg.norm(projections, axis=1)
     mean_radius = radii.mean()
-    cylindricity = float(radii.max() - radii.min())
+    radial_residuals = radii - mean_radius
 
     return {
         "type": "cylindricity",
-        "value": cylindricity,
+        "value": float(np.std(radial_residuals)),
         "mean_radius": float(mean_radius),
         "max_radius": float(radii.max()),
         "min_radius": float(radii.min()),
@@ -83,7 +85,7 @@ def run_evaluation(aligned_points: list, tolerances: dict = None) -> dict:
     points = np.array([[p["x"], p["y"], p["z"]] for p in aligned_points])
 
     if tolerances is None:
-        tolerances = {"flatness": 0.3, "cylindricity": 0.4, "position": 0.3}
+        tolerances = {"flatness": 0.1, "cylindricity": 0.1, "position": 0.2}
 
     flatness = evaluate_flatness(points)
     cylindricity = evaluate_cylindricity(points)
