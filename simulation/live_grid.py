@@ -568,9 +568,10 @@ def stop_docker_containers():
 
 
 if stop_clicked:
-    with st.spinner("Clearing all blob data and draining events..."):
+    with st.spinner("Clearing all blob data, draining events, and stopping containers..."):
         deleted = clear_all_blobs()
         drained = drain_stale_events()
+        stopped = stop_docker_containers()
     st.session_state.phase = "idle"
     st.session_state.results = {}
     st.session_state.images = {}
@@ -581,7 +582,10 @@ if stop_clicked:
     upload_state["done"] = False
     for key, ph in cells.items():
         ph.markdown(":gray[---]")
-    summary_bar.success(f"Cleared {deleted} blobs, drained {drained} events. Ready for a fresh run.")
+    stop_msg = f"Cleared {deleted} blobs, drained {drained} events."
+    if stopped:
+        stop_msg += " Containers stopped."
+    summary_bar.success(f"{stop_msg} Ready for a fresh run.")
     st.stop()
 
 # ---------- Start ----------
@@ -651,11 +655,6 @@ if st.session_state.phase == "running":
                     render_cell(ph, key[0], key[1])
                     st.session_state.rendered.add(key)
             update_summary()
-            # Auto-stop microservice containers to free resources
-            with st.spinner("Stopping microservice containers..."):
-                stopped = stop_docker_containers()
-            if stopped:
-                st.toast("Microservice containers stopped automatically.", icon="🛑")
             st.session_state.phase = "done"
             break
 
