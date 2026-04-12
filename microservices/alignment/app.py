@@ -4,6 +4,9 @@ Alignment Service (Event-Driven)
 Subscribes to: feature-compensated (pulls from alignment-sub)
 Reads from:    compensated/ blob container
 Writes to:     aligned/ blob container (triggers feature-aligned event)
+
+Uses scipy Procrustes + least-squares for lightweight best-fit alignment
+(replaces Open3D ICP which requires too much memory for Docker containers).
 """
 
 import sys
@@ -17,7 +20,8 @@ import logging
 import time
 
 import numpy as np
-import open3d as o3d
+from scipy.spatial import KDTree
+from scipy.spatial.transform import Rotation
 
 from shared.azure_clients import read_blob, write_blob, poll_and_process, extract_blob_name
 
@@ -26,43 +30,96 @@ logger = logging.getLogger("alignment")
 
 # ---------- Core Logic ----------
 
+def best_fit_transform(source: np.ndarray, target: np.ndarray) -> tuple:
+    """Compute best-fit rigid transform (rotation + translation) using SVD.
+    Returns (rotation_matrix 3x3, translation 3x1)."""
+    src_centroid = source.mean(axis=0)
+    tgt_centroid = target.mean(axis=0)
+
+    src_centered = source - src_centroid
+    tgt_centered = target - tgt_centroid
+
+    H = src_centered.T @ tgt_centered
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    # Ensure proper rotation (det = +1)
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    t = tgt_centroid - R @ src_centroid
+    return R, t
+
+
+def icp_scipy(source: np.ndarray, target: np.ndarray, max_iterations: int = 50,
+              tolerance: float = 1e-6, max_distance: float = 2.0) -> dict:
+    """Lightweight ICP using scipy KDTree + SVD best-fit."""
+    start = time.time()
+    src = source.copy()
+    prev_error = float('inf')
+
+    T_total = np.eye(4)
+
+    for i in range(max_iterations):
+        # Find nearest neighbors
+        tree = KDTree(target)
+        distances, indices = tree.query(src)
+
+        # Filter by max distance
+        mask = distances < max_distance
+        if mask.sum() < 3:
+            break
+
+        src_matched = src[mask]
+        tgt_matched = target[indices[mask]]
+
+        # Compute best-fit transform
+        R, t = best_fit_transform(src_matched, tgt_matched)
+
+        # Apply transform
+        src = (R @ src.T).T + t
+
+        # Update total transform
+        T_step = np.eye(4)
+        T_step[:3, :3] = R
+        T_step[:3, 3] = t
+        T_total = T_step @ T_total
+
+        # Check convergence
+        mean_error = distances[mask].mean()
+        if abs(prev_error - mean_error) < tolerance:
+            break
+        prev_error = mean_error
+
+    # Compute final metrics
+    tree = KDTree(target)
+    final_distances, _ = tree.query(src)
+    inlier_mask = final_distances < max_distance
+    fitness = inlier_mask.sum() / len(source)
+    rmse = np.sqrt((final_distances[inlier_mask] ** 2).mean()) if inlier_mask.any() else 0.0
+
+    elapsed = time.time() - start
+    logger.info(f"ICP took {elapsed:.2f}s, fitness={fitness:.4f}, rmse={rmse:.4f}")
+
+    return {
+        "transformationMatrix": T_total.tolist(),
+        "fitness": float(fitness),
+        "rmse": float(rmse),
+        "alignedPoints": [
+            {"x": float(x), "y": float(y), "z": float(z)}
+            for x, y, z in src
+        ],
+    }
+
+
 def align_points(compensated_points: list, nominal_points: list) -> dict:
-    """Align compensated points to nominal geometry using ICP."""
+    """Align compensated points to nominal geometry using scipy ICP."""
     compensated = np.array([[p["x"], p["y"], p["z"]] for p in compensated_points])
     nominal = np.array([[p["x"], p["y"], p["z"]] for p in nominal_points])
 
-    src = o3d.geometry.PointCloud()
-    src.points = o3d.utility.Vector3dVector(compensated)
+    return icp_scipy(compensated, nominal, max_iterations=50, max_distance=2.0)
 
-    tgt = o3d.geometry.PointCloud()
-    tgt.points = o3d.utility.Vector3dVector(nominal)
-
-    src = src.voxel_down_sample(voxel_size=0.5)
-    tgt = tgt.voxel_down_sample(voxel_size=0.5)
-
-    start = time.time()
-    threshold = 2.0
-    trans_init = np.eye(4)
-    criteria = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
-    reg_p2p = o3d.pipelines.registration.registration_icp(
-        src, tgt, threshold, trans_init,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        criteria,
-    )
-    logger.info(f"ICP took {time.time() - start:.2f}s, fitness={reg_p2p.fitness:.4f}, rmse={reg_p2p.inlier_rmse:.4f}")
-
-    aligned_src = src.transform(reg_p2p.transformation)
-    aligned_points = np.asarray(aligned_src.points)
-
-    return {
-        "transformationMatrix": reg_p2p.transformation.tolist(),
-        "fitness": reg_p2p.fitness,
-        "rmse": reg_p2p.inlier_rmse,
-        "alignedPoints": [
-            {"x": float(x), "y": float(y), "z": float(z)}
-            for x, y, z in aligned_points
-        ],
-    }
 
 # ---------- Event Handler ----------
 

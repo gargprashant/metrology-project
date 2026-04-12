@@ -19,6 +19,7 @@ import random
 import threading
 import queue
 import logging
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
@@ -114,26 +115,105 @@ def extract_blob_name(event):
     return ""
 
 
+# ---------- Pipeline Counter (background thread) ----------
+
+def pipeline_counter(counters, signal):
+    """Periodically count blobs in each pipeline stage container."""
+    log.info("pipeline_counter: STARTED")
+    containers = ["compensated", "aligned", "results", "reports"]
+    while True:
+        try:
+            for c in containers:
+                count = sum(1 for _ in blob_service.get_container_client(c).list_blobs())
+                counters[c] = count
+            log.info(f"pipeline_counter: comp={counters['compensated']} align={counters['aligned']} eval={counters['results']} report={counters['reports']}")
+            signal.set()
+        except Exception as e:
+            log.error(f"pipeline_counter: {e}", exc_info=True)
+        time.sleep(3)
+
+
 # ---------- Event Listener (background thread) ----------
 
-def event_listener(rq, signal):
+def event_listener(results, img_queue, counters, signal):
+    """Receive events → fetch report → update counters → signal UI immediately.
+    Queues (ci, fi) for image_worker to handle point data + rendering separately."""
     log.info("event_listener: STARTED")
     while True:
         try:
-            details_list = event_consumer.receive(max_events=10, max_wait_time=10)
-            tokens = []
+            details_list = event_consumer.receive(max_events=1, max_wait_time=10)
+            ack_tokens = []
             for detail in details_list:
                 blob_name = extract_blob_name(detail.event)
-                if blob_name:
-                    rq.put(blob_name)
-                    log.info(f"event_listener: got {blob_name}")
-                tokens.append(detail.broker_properties.lock_token)
-            if tokens:
-                event_consumer.acknowledge(lock_tokens=tokens)
-                signal.set()  # wake up UI loop
+                token = detail.broker_properties.lock_token
+                if not blob_name:
+                    ack_tokens.append(token)
+                    continue
+
+                key = parse_key(blob_name)
+                if key is None or key in results:
+                    ack_tokens.append(token)
+                    continue
+                counters["events"] += 1
+                signal.set()
+                ci, fi = key
+                log.info(f"event_listener: processing {blob_name}")
+
+                report = read_blob("reports", blob_name)
+                if not report:
+                    log.warning(f"event_listener: report not found: {blob_name} — skipping ack, will redeliver")
+                    continue
+
+                ack_tokens.append(token)
+                results[key] = report
+
+                # Update counters
+                p = report.get("summary", {}).get("passed", 0)
+                t = report.get("summary", {}).get("total_checks", 0)
+                if p == t:
+                    counters["pass"] += 1
+                else:
+                    counters["fail"] += 1
+                signal.set()  # wake UI — badge ready
+
+                # Queue for image rendering
+                img_queue.put(key)
+
+            if ack_tokens:
+                event_consumer.acknowledge(lock_tokens=ack_tokens)
         except Exception as e:
             log.error(f"event_listener: error: {e}")
             time.sleep(2)
+
+
+def _render_one(key, img_store, pt_store, signal):
+    """Fetch point data + render static image for one cell."""
+    try:
+        ci, fi = key
+        cmm_id = f"CMM_{str(ci+1).zfill(2)}"
+        scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
+        raw = read_blob("rawscan", scan_name)
+        aligned = read_blob("aligned", scan_name)
+        nom = raw.get("nominalPoints", []) if raw else []
+        act = aligned.get("alignedPoints", []) if aligned else []
+        pt_store[key] = (nom, act)
+        if nom or act:
+            img_store[key] = make_static_3d(nom, act)
+            signal.set()  # wake UI — plot ready
+    except Exception as e:
+        log.error(f"_render_one: error for {key}: {e}")
+
+
+def image_worker(img_queue, img_store, pt_store, signal):
+    """Dispatch plot rendering to a thread pool for parallel processing."""
+    log.info("image_worker: STARTED")
+    pool = ThreadPoolExecutor(max_workers=10)
+    while True:
+        try:
+            key = img_queue.get()
+            pool.submit(_render_one, key, img_store, pt_store, signal)
+        except Exception as e:
+            log.error(f"image_worker: error: {e}")
 
 
 # ---------- Plot ----------
@@ -143,15 +223,15 @@ def make_static_3d(nominal_pts, actual_pts):
     ax = fig.add_subplot(111, projection="3d")
     if nominal_pts:
         pts = nominal_pts[::3]
-        ax.scatter([p["x"] for p in pts], [p["y"] for p in pts], [p["z"] for p in pts],
+        ax.scatter3D([p["x"] for p in pts], [p["y"] for p in pts], 0,
                    c="#2196F3", s=1, alpha=0.5)
     if actual_pts:
         pts = actual_pts[::3]
-        ax.scatter([p["x"] for p in pts], [p["y"] for p in pts], [p["z"] for p in pts],
+        ax.scatter3D([p["x"] for p in pts], [p["y"] for p in pts], 0,
                    c="#FF5722", s=1, alpha=0.5)
     ax.set_xticklabels([])
     ax.set_yticklabels([])
-    ax.set_zticklabels([])
+    #ax.set_zticklabels([])
     ax.set_xlabel("")
     ax.set_ylabel("")
     ax.set_zlabel("")
@@ -181,7 +261,7 @@ def make_interactive_3d(nominal_pts, actual_pts, title=""):
         ))
     fig.update_layout(
         title=dict(text=title, font=dict(size=14)),
-        height=600, margin=dict(l=0, r=0, t=40, b=0),
+        height=600, width=900, margin=dict(l=0, r=0, t=40, b=0),
         legend=dict(x=0, y=1),
         scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
     )
@@ -221,8 +301,9 @@ def drip_feed(us, signal):
     jobs = []
     for ci in range(NUM_CMMS):
         for fi in range(FEATURES_PER_CMM):
-            jobs.append((ci, fi, random.choice(ALL_SHAPES),
-                         random.choice([0.005, 0.01, 0.015, 0.02, 0.06, 0.08, 0.10, 0.12])))
+            # ~50% pass: near-zero noise passes GDT checks, high noise fails
+            sigma = random.choice([0.0001, 0.0005, 0.001, 0.002, 0.5, 0.8, 1.0, 1.5])
+            jobs.append((ci, fi, random.choice(ALL_SHAPES), sigma))
     random.shuffle(jobs)
 
     for ci, fi, shape, sigma in jobs:
@@ -256,80 +337,17 @@ if "phase" not in st.session_state:
     st.session_state.results = {}            # (ci, fi) -> report dict
     st.session_state.images = {}             # (ci, fi) -> PNG bytes
     st.session_state.point_data = {}         # (ci, fi) -> (nom, act)
-    st.session_state.counters = {"pass": 0, "fail": 0}
+    st.session_state.counters = {"pass": 0, "fail": 0, "events": 0, "compensated": 0, "aligned": 0, "results": 0, "reports": 0}
     st.session_state.threads_started = False
-    st.session_state.report_queue = queue.Queue()
     st.session_state.upload_state = {"count": 0, "done": False}
-    st.session_state.image_pool = ThreadPoolExecutor(max_workers=10)
     st.session_state.data_ready = threading.Event()
+    st.session_state.image_queue = queue.Queue()
 
 # Convenience aliases — same object on every rerun, threads see the same instance
-report_queue = st.session_state.report_queue
 upload_state = st.session_state.upload_state
-image_pool = st.session_state.image_pool
 data_ready = st.session_state.data_ready
 
 
-# ---------- Process new events from queue ----------
-
-def _fetch_and_render(ci, fi, blob_name, results, img_store, pt_store, counters, signal):
-    """Pool worker: fetch report + point data + render static image."""
-    key = (ci, fi)
-    # Fetch report
-    report = read_blob("reports", blob_name)
-    if not report:
-        return
-    results[key] = report
-
-    # Update counters
-    p = report.get("summary", {}).get("passed", 0)
-    t = report.get("summary", {}).get("total_checks", 0)
-    if p == t:
-        counters["pass"] += 1
-    else:
-        counters["fail"] += 1
-    signal.set()  # wake UI — report ready
-
-    # Fetch point data + render image
-    cmm_id = f"CMM_{str(ci+1).zfill(2)}"
-    scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
-    raw = read_blob("rawscan", scan_name)
-    aligned = read_blob("aligned", scan_name)
-    nom = raw.get("nominalPoints", []) if raw else []
-    act = aligned.get("alignedPoints", []) if aligned else []
-    pt_store[key] = (nom, act)
-    if nom or act:
-        img_store[key] = make_static_3d(nom, act)
-        signal.set()  # wake UI — image ready
-
-
-def drain_queue():
-    """Pull all pending events — zero HTTP calls, just submit to pool."""
-    new_count = 0
-    while not report_queue.empty():
-        try:
-            blob_name = report_queue.get_nowait()
-        except queue.Empty:
-            break
-
-        key = parse_key(blob_name)
-        if key is None or key in st.session_state.results:
-            continue
-        ci, fi = key
-
-        # Mark as pending immediately (so counter updates on next rerun)
-        st.session_state.results[key] = "pending"
-
-        # All HTTP calls + rendering happen in pool thread
-        image_pool.submit(
-            _fetch_and_render, ci, fi, blob_name,
-            st.session_state.results, st.session_state.images,
-            st.session_state.point_data, st.session_state.counters,
-            data_ready,
-        )
-        new_count += 1
-
-    return new_count
 
 
 
@@ -478,6 +496,15 @@ def render_cell(placeholder, ci, fi):
         )
         if img:
             st.image(img, width="stretch")
+            with st.popover("3D"):
+                nom, act = st.session_state.point_data.get(key, ([], []))
+                if nom or act:
+                    st.plotly_chart(
+                        make_interactive_3d(nom, act, f"CMM_{str(ci+1).zfill(2)} / F{str(fi+1).zfill(2)}"),
+                        key=f"plotly3d_{ci}_{fi}",
+                    )
+                else:
+                    st.info("Point data not available.")
 
 
 def update_summary():
@@ -489,32 +516,68 @@ def update_summary():
     if done >= total:
         summary_bar.success(f"All {total} scans processed!  PASS: {pc}  |  FAIL: {fc}")
     elif st.session_state.phase == "running":
+        ec = st.session_state.counters["events"]
+        cc = st.session_state.counters["compensated"]
+        ac = st.session_state.counters["aligned"]
+        gc = st.session_state.counters["results"]
+        rc = st.session_state.counters["reports"]
         upload_msg = f"All {uc} scans uploaded." if upload_state["done"] else f"CMMs scanning: {uc}/{total} uploaded..."
         summary_bar.markdown(
             f"**Completed: {done}/{total}  |  "
             f":green[PASS: {pc}]  |  :red[FAIL: {fc}]  |  "
+            f"Events: {ec}  |  "
             f"Remaining: {total - done}  |  "
-            f"Uploaded: {uc}/{total}**\n\n{upload_msg}"
+            f"Uploaded: {uc}/{total}**\n\n"
+            f"**Pipeline: Compensated: {cc}  |  Aligned: {ac}  |  Evaluated: {gc}  |  Reported: {rc}**\n\n"
+            f"{upload_msg}"
         )
     elif st.session_state.phase == "idle":
         summary_bar.info("Press **Start** to begin.")
 
 
 # ---------- Stop ----------
+def drain_stale_events():
+    """Acknowledge pending events so they don't pollute the next run. Single pass only."""
+    details = event_consumer.receive(max_events=100, max_wait_time=10)
+    if details:
+        tokens = [d.broker_properties.lock_token for d in details]
+        event_consumer.acknowledge(lock_tokens=tokens)
+    return len(details)
+
+
+def stop_docker_containers():
+    """Stop all microservice containers (not the dashboard) after pipeline completes."""
+    try:
+        compose_dir = os.path.join(os.path.dirname(__file__), "..")
+        result = subprocess.run(
+            ["docker", "compose", "stop",
+             "probe_compensation", "alignment", "gdt_evaluation", "reporting"],
+            cwd=compose_dir, capture_output=True, text=True, timeout=60,
+        )
+        log.info(f"stop_docker_containers: {result.stdout.strip()}")
+        if result.returncode != 0:
+            log.error(f"stop_docker_containers stderr: {result.stderr.strip()}")
+        return result.returncode == 0
+    except Exception as e:
+        log.error(f"stop_docker_containers: {e}")
+        return False
+
+
 if stop_clicked:
-    with st.spinner("Clearing all blob data..."):
+    with st.spinner("Clearing all blob data and draining events..."):
         deleted = clear_all_blobs()
+        drained = drain_stale_events()
     st.session_state.phase = "idle"
     st.session_state.results = {}
     st.session_state.images = {}
     st.session_state.point_data = {}
-    st.session_state.counters = {"pass": 0, "fail": 0}
+    st.session_state.counters = {"pass": 0, "fail": 0, "events": 0, "compensated": 0, "aligned": 0, "results": 0, "reports": 0}
     st.session_state.threads_started = False
     upload_state["count"] = 0
     upload_state["done"] = False
     for key, ph in cells.items():
         ph.markdown(":gray[---]")
-    summary_bar.success(f"Cleared {deleted} blobs. Ready for a fresh run.")
+    summary_bar.success(f"Cleared {deleted} blobs, drained {drained} events. Ready for a fresh run.")
     st.stop()
 
 # ---------- Start ----------
@@ -524,7 +587,7 @@ if start_clicked and st.session_state.phase == "idle":
     st.session_state.results = {}
     st.session_state.images = {}
     st.session_state.point_data = {}
-    st.session_state.counters = {"pass": 0, "fail": 0}
+    st.session_state.counters = {"pass": 0, "fail": 0, "events": 0, "compensated": 0, "aligned": 0, "results": 0, "reports": 0}
     upload_state["count"] = 0
     upload_state["done"] = False
     st.session_state.threads_started = False
@@ -537,8 +600,16 @@ if start_clicked and st.session_state.phase == "idle":
 if st.session_state.phase == "running":
     if not st.session_state.threads_started:
         log.info("PHASE running: starting background threads")
-        threading.Thread(target=event_listener, args=(report_queue, data_ready), daemon=True).start()
+        threading.Thread(target=event_listener, args=(
+            st.session_state.results, st.session_state.image_queue,
+            st.session_state.counters, data_ready,
+        ), daemon=True).start()
+        threading.Thread(target=image_worker, args=(
+            st.session_state.image_queue, st.session_state.images,
+            st.session_state.point_data, data_ready,
+        ), daemon=True).start()
         threading.Thread(target=drip_feed, args=(upload_state, data_ready), daemon=True).start()
+        threading.Thread(target=pipeline_counter, args=(st.session_state.counters, data_ready), daemon=True).start()
         st.session_state.threads_started = True
 
     if "rendered" not in st.session_state:
@@ -552,7 +623,6 @@ if st.session_state.phase == "running":
         data_ready.wait(timeout=5)
         data_ready.clear()
 
-        drain_queue()
         update_summary()
 
         # Update only cells that have new data
@@ -573,9 +643,15 @@ if st.session_state.phase == "running":
         done = st.session_state.counters["pass"] + st.session_state.counters["fail"]
         if done >= total:
             for key, ph in cells.items():
-                if key in st.session_state.images:
+                if key in st.session_state.images and key not in st.session_state.rendered:
                     render_cell(ph, key[0], key[1])
+                    st.session_state.rendered.add(key)
             update_summary()
+            # Auto-stop microservice containers to free resources
+            with st.spinner("Stopping microservice containers..."):
+                stopped = stop_docker_containers()
+            if stopped:
+                st.toast("Microservice containers stopped automatically.", icon="🛑")
             st.session_state.phase = "done"
             break
 

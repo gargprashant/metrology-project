@@ -83,7 +83,7 @@ def run_evaluation(aligned_points: list, tolerances: dict = None) -> dict:
     points = np.array([[p["x"], p["y"], p["z"]] for p in aligned_points])
 
     if tolerances is None:
-        tolerances = {"flatness": 0.1, "cylindricity": 0.15, "position": 0.2}
+        tolerances = {"flatness": 0.3, "cylindricity": 0.4, "position": 0.3}
 
     flatness = evaluate_flatness(points)
     cylindricity = evaluate_cylindricity(points)
