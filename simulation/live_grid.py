@@ -98,7 +98,10 @@ def clear_all_blobs():
             pass
 
     def delete_one(job):
-        blob_service.get_container_client(job[0]).delete_blob(job[1])
+        try:
+            blob_service.get_container_client(job[0]).delete_blob(job[1])
+        except Exception:
+            pass
 
     with ThreadPoolExecutor(max_workers=20) as ex:
         list(ex.map(delete_one, all_jobs))
@@ -210,18 +213,16 @@ def _render_one(key, img_store, pt_store, signal):
 
 
 def image_worker(img_queue, img_store, pt_store, signal, stop):
-    """Dispatch plot rendering to a thread pool for parallel processing."""
+    """Process plot rendering sequentially — matplotlib is not thread-safe."""
     log.info("image_worker: STARTED")
-    pool = ThreadPoolExecutor(max_workers=10)
     while not stop.is_set():
         try:
             key = img_queue.get(timeout=1)
-            pool.submit(_render_one, key, img_store, pt_store, signal)
+            _render_one(key, img_store, pt_store, signal)
         except queue.Empty:
             continue
         except Exception as e:
             log.error(f"image_worker: error: {e}")
-    pool.shutdown(wait=False)
     log.info("image_worker: STOPPED")
 
 
@@ -682,11 +683,8 @@ if st.session_state.phase == "running":
                 ph.markdown(":orange[loading...]")
 
         done = st.session_state.counters["pass"] + st.session_state.counters["fail"]
-        if done >= total:
-            for key, ph in cells.items():
-                if key in st.session_state.images and key not in st.session_state.rendered:
-                    render_cell(ph, key[0], key[1])
-                    st.session_state.rendered.add(key)
+        rendered_count = len(st.session_state.rendered)
+        if done >= total and rendered_count >= total:
             update_summary()
             st.session_state.phase = "done"
             break
