@@ -143,9 +143,9 @@ def pipeline_counter(counters, signal, stop):
 
 # ---------- Event Listener (background thread) ----------
 
-def event_listener(results, img_queue, counters, signal, stop):
-    """Receive events → fetch report → update counters → signal UI immediately.
-    Queues (ci, fi) for image_worker to handle point data + rendering separately."""
+def event_listener(results, img_store, pt_store, counters, signal, stop):
+    """Receive events → fetch report + plot data → render image → signal UI.
+    Each cell appears complete (result + plot) in one shot."""
     log.info("event_listener: STARTED")
     while not stop.is_set():
         try:
@@ -162,8 +162,6 @@ def event_listener(results, img_queue, counters, signal, stop):
                 if key is None or key in results:
                     ack_tokens.append(token)
                     continue
-                counters["events"] += 1
-                signal.set()
                 ci, fi = key
                 log.info(f"event_listener: processing {blob_name}")
 
@@ -173,19 +171,28 @@ def event_listener(results, img_queue, counters, signal, stop):
                     continue
 
                 ack_tokens.append(token)
-                results[key] = report
 
-                # Update counters
+                # Fetch plot data and render image
+                cmm_id = f"CMM_{str(ci+1).zfill(2)}"
+                scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
+                raw = read_blob("rawscan", scan_name)
+                aligned = read_blob("aligned", scan_name)
+                nom = raw.get("nominalPoints", []) if raw else []
+                act = aligned.get("alignedPoints", []) if aligned else []
+                pt_store[key] = (nom, act)
+                if nom or act:
+                    img_store[key] = make_static_3d(nom, act)
+
+                # Store result and update counters
+                results[key] = report
+                counters["events"] += 1
                 p = report.get("summary", {}).get("passed", 0)
                 t = report.get("summary", {}).get("total_checks", 0)
                 if p == t:
                     counters["pass"] += 1
                 else:
                     counters["fail"] += 1
-                signal.set()  # wake UI — badge ready
-
-                # Queue for image rendering
-                img_queue.put(key)
+                signal.set()  # wake UI — result + plot ready together
 
             if ack_tokens:
                 event_consumer.acknowledge(lock_tokens=ack_tokens)
@@ -194,36 +201,6 @@ def event_listener(results, img_queue, counters, signal, stop):
             time.sleep(2)
 
 
-def _render_one(key, img_store, pt_store, signal):
-    """Fetch point data + render static image for one cell."""
-    try:
-        ci, fi = key
-        cmm_id = f"CMM_{str(ci+1).zfill(2)}"
-        scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
-        raw = read_blob("rawscan", scan_name)
-        aligned = read_blob("aligned", scan_name)
-        nom = raw.get("nominalPoints", []) if raw else []
-        act = aligned.get("alignedPoints", []) if aligned else []
-        pt_store[key] = (nom, act)
-        if nom or act:
-            img_store[key] = make_static_3d(nom, act)
-            signal.set()  # wake UI — plot ready
-    except Exception as e:
-        log.error(f"_render_one: error for {key}: {e}")
-
-
-def image_worker(img_queue, img_store, pt_store, signal, stop):
-    """Process plot rendering sequentially — matplotlib is not thread-safe."""
-    log.info("image_worker: STARTED")
-    while not stop.is_set():
-        try:
-            key = img_queue.get(timeout=1)
-            _render_one(key, img_store, pt_store, signal)
-        except queue.Empty:
-            continue
-        except Exception as e:
-            log.error(f"image_worker: error: {e}")
-    log.info("image_worker: STOPPED")
 
 
 # ---------- Plot ----------
@@ -643,12 +620,9 @@ if st.session_state.phase == "running":
         log.info("PHASE running: starting background threads")
         stop = st.session_state.stop_signal
         threading.Thread(target=event_listener, args=(
-            st.session_state.results, st.session_state.image_queue,
+            st.session_state.results, st.session_state.images,
+            st.session_state.point_data,
             st.session_state.counters, data_ready, stop,
-        ), daemon=True).start()
-        threading.Thread(target=image_worker, args=(
-            st.session_state.image_queue, st.session_state.images,
-            st.session_state.point_data, data_ready, stop,
         ), daemon=True).start()
         threading.Thread(target=drip_feed, args=(upload_state, data_ready, stop), daemon=True).start()
         threading.Thread(target=pipeline_counter, args=(st.session_state.counters, data_ready, stop), daemon=True).start()
@@ -677,8 +651,6 @@ if st.session_state.phase == "running":
             if isinstance(result, dict) and img_ready and not already:
                 render_cell(ph, ci, fi)
                 st.session_state.rendered.add(key)
-            elif isinstance(result, dict) and not img_ready and not already:
-                render_cell(ph, ci, fi)
             elif result == "pending" and not already:
                 ph.markdown(":orange[loading...]")
 
