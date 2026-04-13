@@ -1,78 +1,171 @@
-# microservices/alignment/app.py
-from fastapi import FastAPI, Request   
-from pydantic import BaseModel
-import numpy as np
-import open3d as o3d
+"""
+Alignment Service (Event-Driven)
+
+Subscribes to: feature-compensated (pulls from alignment-sub)
+Reads from:    compensated/ blob container
+Writes to:     aligned/ blob container (triggers feature-aligned event)
+
+Uses scipy Procrustes + least-squares for lightweight best-fit alignment
+(replaces Open3D ICP which requires too much memory for Docker containers).
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+import threading
 import logging
 import time
 
+import numpy as np
+from scipy.spatial import KDTree
+from scipy.spatial.transform import Rotation
+
+from shared.azure_clients import read_blob, write_blob, poll_and_process, extract_blob_name
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("alignment-service")
+logger = logging.getLogger("alignment")
 
-class Point(BaseModel):
-    x: float
-    y: float
-    z: float
+# ---------- Core Logic ----------
 
-app = FastAPI()
+def best_fit_transform(source: np.ndarray, target: np.ndarray) -> tuple:
+    """Compute best-fit rigid transform (rotation + translation) using SVD.
+    Returns (rotation_matrix 3x3, translation 3x1)."""
+    src_centroid = source.mean(axis=0)
+    tgt_centroid = target.mean(axis=0)
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
+    src_centered = source - src_centroid
+    tgt_centered = target - tgt_centroid
+
+    H = src_centered.T @ tgt_centered
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    # Ensure proper rotation (det = +1)
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    t = tgt_centroid - R @ src_centroid
+    return R, t
+
+
+def icp_scipy(source: np.ndarray, target: np.ndarray, max_iterations: int = 50,
+              tolerance: float = 1e-6, max_distance: float = 2.0) -> dict:
+    """Lightweight ICP using scipy KDTree + SVD best-fit."""
     start = time.time()
-    response = await call_next(request)
-    duration = time.time() - start
-    logger.info(f"{request.method} {request.url} status={response.status_code} duration={duration:.3f}s")
-    return response
+    src = source.copy()
+    prev_error = float('inf')
 
-class AlignmentRequest(BaseModel):
-    compensatedPoints: list[Point]
-    nominalPoints: list[Point]
+    T_total = np.eye(4)
 
-@app.post("/alignPoints")
-def align_points(req: AlignmentRequest):
-    try:
-        logger.info(f"Received alignment request with {len(req.compensatedPoints)} compensated points and {len(req.nominalPoints)} nominal points")
-        compensated = np.array([[p.x, p.y, p.z] for p in req.compensatedPoints])
-        nominal = np.array([[p.x, p.y, p.z] for p in req.nominalPoints])
+    for i in range(max_iterations):
+        # Find nearest neighbors
+        tree = KDTree(target)
+        distances, indices = tree.query(src)
 
-        src = o3d.geometry.PointCloud()
-        src.points = o3d.utility.Vector3dVector(compensated)
+        # Filter by max distance
+        mask = distances < max_distance
+        if mask.sum() < 3:
+            break
 
-        tgt = o3d.geometry.PointCloud()
-        tgt.points = o3d.utility.Vector3dVector(nominal)
+        src_matched = src[mask]
+        tgt_matched = target[indices[mask]]
 
-        src = src.voxel_down_sample(voxel_size=0.5)
-        tgt = tgt.voxel_down_sample(voxel_size=0.5)
+        # Compute best-fit transform
+        R, t = best_fit_transform(src_matched, tgt_matched)
 
-        logger.info("Starting ICP alignment...")
-        
-        start = time.time()
+        # Apply transform
+        src = (R @ src.T).T + t
 
-        threshold = 2.0
-        trans_init = np.eye(4)
-        criteria = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
-        reg_p2p = o3d.pipelines.registration.registration_icp(
-            src, tgt, threshold, trans_init,
-            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            criteria
-        )
+        # Update total transform
+        T_step = np.eye(4)
+        T_step[:3, :3] = R
+        T_step[:3, 3] = t
+        T_total = T_step @ T_total
 
-        logger.info(f"ICP took {time.time() - start:.2f}s")
+        # Check convergence
+        mean_error = distances[mask].mean()
+        if abs(prev_error - mean_error) < tolerance:
+            break
+        prev_error = mean_error
+
+    # Compute final metrics
+    tree = KDTree(target)
+    final_distances, _ = tree.query(src)
+    inlier_mask = final_distances < max_distance
+    fitness = inlier_mask.sum() / len(source)
+    rmse = np.sqrt((final_distances[inlier_mask] ** 2).mean()) if inlier_mask.any() else 0.0
+
+    elapsed = time.time() - start
+    logger.info(f"ICP took {elapsed:.2f}s, fitness={fitness:.4f}, rmse={rmse:.4f}")
+
+    return {
+        "transformationMatrix": T_total.tolist(),
+        "fitness": float(fitness),
+        "rmse": float(rmse),
+        "alignedPoints": [
+            {"x": float(x), "y": float(y), "z": float(z)}
+            for x, y, z in src
+        ],
+    }
 
 
-        aligned_src = src.transform(reg_p2p.transformation)
-        aligned_points = np.asarray(aligned_src.points)
-        logger.info(f"ICP completed with fitness={reg_p2p.fitness:.4f} and rmse={reg_p2p.inlier_rmse:.4f}")
+def align_points(compensated_points: list, nominal_points: list) -> dict:
+    """Align compensated points to nominal geometry using scipy ICP."""
+    compensated = np.array([[p["x"], p["y"], p["z"]] for p in compensated_points])
+    nominal = np.array([[p["x"], p["y"], p["z"]] for p in nominal_points])
 
-        return {
-            "transformationMatrix": reg_p2p.transformation.tolist(),
-            "fitness": reg_p2p.fitness,
-            "rmse": reg_p2p.inlier_rmse,
-            "alignedPoints": [
-                {"x": float(x), "y": float(y), "z": float(z)} for x, y, z in aligned_points
-            ]
-        }
-    except Exception as e:
-        logger.error(f"Alignment failed: {e}")
-        return {"error": str(e)}
+    return icp_scipy(compensated, nominal, max_iterations=50, max_distance=2.0)
 
+
+# ---------- Event Handler ----------
+
+def handle_event(event):
+    """Process a feature-compensated event."""
+    blob_name = extract_blob_name(event)
+
+    logger.info(f"Processing compensated blob: compensated/{blob_name}")
+
+    # Read compensated data
+    comp_data = read_blob("compensated", blob_name)
+
+    # The compensated blob includes nominal points passed through from the raw scan
+    nominal_points = comp_data.get("nominalPoints", [])
+    if not nominal_points:
+        logger.error(f"No nominal points found in compensated/{blob_name}, skipping")
+        return
+
+    result = align_points(comp_data["compensatedPoints"], nominal_points)
+
+    # Build output
+    output = {
+        "cmmId": comp_data["cmmId"],
+        "alignedPoints": result["alignedPoints"],
+        "transformationMatrix": result["transformationMatrix"],
+        "fitness": result["fitness"],
+        "rmse": result["rmse"],
+        "sourceBlob": f"compensated/{blob_name}",
+    }
+
+    # Write to aligned/ container (triggers feature-aligned event)
+    write_blob("aligned", blob_name, output)
+    logger.info(f"Alignment complete for {blob_name}")
+
+# ---------- FastAPI App with Background Polling ----------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    thread = threading.Thread(target=poll_and_process, args=(handle_event,), daemon=True)
+    thread.start()
+    logger.info("Event polling started")
+    yield
+    logger.info("Shutting down")
+
+app = FastAPI(title="Alignment Service", lifespan=lifespan)
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "service": "alignment"}

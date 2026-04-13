@@ -1,61 +1,88 @@
-from fastapi import FastAPI, Request   
-from pydantic import BaseModel
-from typing import List
+"""
+Probe Compensation Service (Event-Driven)
+
+Subscribes to: feature-scanned (pulls from probe-compensation-sub)
+Reads from:    rawscan/ blob container
+Writes to:     compensated/ blob container (triggers feature-compensated event)
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+import threading
 import logging
-import time
+
+from shared.azure_clients import read_blob, write_blob, poll_and_process, extract_blob_name
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("alignment-service")
-
-app = FastAPI(title="Probe Compensation Service")
-
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start = time.time()
-    response = await call_next(request)
-    duration = time.time() - start
-    logger.info(f"{request.method} {request.url} status={response.status_code} duration={duration:.3f}s")
-    return response
-
-# ---------- Request/Response Models ----------
-
-class Point(BaseModel):
-    x: float
-    y: float
-    z: float
-    normal: List[float]
-
-class ProbeRequest(BaseModel):
-    cmmId: str
-    probeDiameter: float
-    points: List[Point]
-
-class CompensatedPoint(BaseModel):
-    x: float
-    y: float
-    z: float
-
-class ProbeResponse(BaseModel):
-    compensatedPoints: List[CompensatedPoint]
+logger = logging.getLogger("probe-compensation")
 
 # ---------- Core Logic ----------
 
-@app.post("/compensateProbe", response_model=ProbeResponse)
-def compensate_probe(request: ProbeRequest):
+def compensate_points(cmm_id: str, probe_diameter: float, points: list) -> list:
+    """Apply probe radius compensation to tip points."""
     compensated = []
-    radius = request.probeDiameter / 2.0
+    radius = probe_diameter / 2.0
 
-    for pt in request.points:
-        nx, ny, nz = pt.normal
-        # Normalize normal vector
+    for pt in points:
+        nx, ny, nz = pt["normal"]
         norm_len = (nx**2 + ny**2 + nz**2) ** 0.5
-        nx, ny, nz = nx/norm_len, ny/norm_len, nz/norm_len
+        nx, ny, nz = nx / norm_len, ny / norm_len, nz / norm_len
 
-        # Apply probe compensation
-        cx = pt.x - radius * nx
-        cy = pt.y - radius * ny
-        cz = pt.z - radius * nz
+        compensated.append({
+            "x": pt["x"] - radius * nx,
+            "y": pt["y"] - radius * ny,
+            "z": pt["z"] - radius * nz,
+        })
 
-        compensated.append(CompensatedPoint(x=cx, y=cy, z=cz))
+    return compensated
 
-    return ProbeResponse(compensatedPoints=compensated)
+# ---------- Event Handler ----------
+
+def handle_event(event):
+    """Process a feature-scanned event."""
+    blob_name = extract_blob_name(event)
+
+    logger.info(f"Processing raw scan blob: rawscan/{blob_name}")
+
+    # Read raw scan data from blob
+    raw_data = read_blob("rawscan", blob_name)
+
+    # Compensate
+    compensated_points = compensate_points(
+        cmm_id=raw_data["cmmId"],
+        probe_diameter=raw_data["probeDiameter"],
+        points=raw_data["points"],
+    )
+
+    # Build output — pass nominal points through for alignment stage
+    output = {
+        "cmmId": raw_data["cmmId"],
+        "probeDiameter": raw_data["probeDiameter"],
+        "compensatedPoints": compensated_points,
+        "nominalPoints": raw_data.get("nominalPoints", []),
+        "sourceBlob": f"rawscan/{blob_name}",
+    }
+
+    # Write to compensated/ container (triggers feature-compensated event)
+    write_blob("compensated", blob_name, output)
+    logger.info(f"Compensation complete for {blob_name}")
+
+# ---------- FastAPI App with Background Polling ----------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    thread = threading.Thread(target=poll_and_process, args=(handle_event,), daemon=True)
+    thread.start()
+    logger.info("Event polling started")
+    yield
+    logger.info("Shutting down")
+
+app = FastAPI(title="Probe Compensation Service", lifespan=lifespan)
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "service": "probe-compensation"}
