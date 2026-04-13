@@ -191,6 +191,9 @@ def event_listener(results, img_queue, counters, signal, stop):
             time.sleep(2)
 
 
+_plot_lock = threading.Lock()
+
+
 def _render_one(key, img_store, pt_store, signal):
     """Fetch point data + render static image for one cell."""
     try:
@@ -203,7 +206,8 @@ def _render_one(key, img_store, pt_store, signal):
         act = aligned.get("alignedPoints", []) if aligned else []
         pt_store[key] = (nom, act)
         if nom or act:
-            img_store[key] = make_static_3d(nom, act)
+            with _plot_lock:
+                img_store[key] = make_static_3d(nom, act)
             signal.set()  # wake UI — plot ready
     except Exception as e:
         log.error(f"_render_one: error for {key}: {e}")
