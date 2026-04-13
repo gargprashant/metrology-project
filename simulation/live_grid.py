@@ -121,11 +121,11 @@ def extract_blob_name(event):
 
 # ---------- Pipeline Counter (background thread) ----------
 
-def pipeline_counter(counters, signal):
+def pipeline_counter(counters, signal, stop):
     """Periodically count blobs in each pipeline stage container."""
     log.info("pipeline_counter: STARTED")
     containers = ["compensated", "aligned", "results", "reports"]
-    while True:
+    while not stop.is_set():
         try:
             for c in containers:
                 count = sum(1 for _ in blob_service.get_container_client(c).list_blobs())
@@ -134,16 +134,17 @@ def pipeline_counter(counters, signal):
             signal.set()
         except Exception as e:
             log.error(f"pipeline_counter: {e}", exc_info=True)
-        time.sleep(3)
+        stop.wait(3)  # interruptible sleep
+    log.info("pipeline_counter: STOPPED")
 
 
 # ---------- Event Listener (background thread) ----------
 
-def event_listener(results, img_queue, counters, signal):
+def event_listener(results, img_queue, counters, signal, stop):
     """Receive events → fetch report → update counters → signal UI immediately.
     Queues (ci, fi) for image_worker to handle point data + rendering separately."""
     log.info("event_listener: STARTED")
-    while True:
+    while not stop.is_set():
         try:
             details_list = event_consumer.receive(max_events=1, max_wait_time=10)
             ack_tokens = []
@@ -208,16 +209,20 @@ def _render_one(key, img_store, pt_store, signal):
         log.error(f"_render_one: error for {key}: {e}")
 
 
-def image_worker(img_queue, img_store, pt_store, signal):
+def image_worker(img_queue, img_store, pt_store, signal, stop):
     """Dispatch plot rendering to a thread pool for parallel processing."""
     log.info("image_worker: STARTED")
     pool = ThreadPoolExecutor(max_workers=10)
-    while True:
+    while not stop.is_set():
         try:
-            key = img_queue.get()
+            key = img_queue.get(timeout=1)
             pool.submit(_render_one, key, img_store, pt_store, signal)
+        except queue.Empty:
+            continue
         except Exception as e:
             log.error(f"image_worker: error: {e}")
+    pool.shutdown(wait=False)
+    log.info("image_worker: STOPPED")
 
 
 # ---------- Plot ----------
@@ -297,7 +302,7 @@ def upload_one(cmm_idx, feat_idx, shape, sigma):
     )
 
 
-def drip_feed(us, signal):
+def drip_feed(us, signal, stop):
     log.info("drip_feed: STARTED")
     us["count"] = 0
     us["done"] = False
@@ -311,6 +316,9 @@ def drip_feed(us, signal):
     random.shuffle(jobs)
 
     for ci, fi, shape, sigma in jobs:
+        if stop.is_set():
+            log.info("drip_feed: STOPPED early")
+            return
         try:
             upload_one(ci, fi, shape, sigma)
             us["count"] += 1
@@ -346,6 +354,7 @@ if "phase" not in st.session_state:
     st.session_state.upload_state = {"count": 0, "done": False}
     st.session_state.data_ready = threading.Event()
     st.session_state.image_queue = queue.Queue()
+    st.session_state.stop_signal = threading.Event()
 
 # Convenience aliases — same object on every rerun, threads see the same instance
 upload_state = st.session_state.upload_state
@@ -567,7 +576,26 @@ def stop_docker_containers():
         return False
 
 
+def start_docker_containers():
+    """Start all microservice containers that may have been stopped."""
+    try:
+        compose_dir = os.path.join(os.path.dirname(__file__), "..")
+        result = subprocess.run(
+            ["docker", "compose", "start",
+             "probe_compensation", "alignment", "gdt_evaluation", "reporting"],
+            cwd=compose_dir, capture_output=True, text=True, timeout=60,
+        )
+        log.info(f"start_docker_containers: {result.stdout.strip()}")
+        if result.returncode != 0:
+            log.error(f"start_docker_containers stderr: {result.stderr.strip()}")
+        return result.returncode == 0
+    except Exception as e:
+        log.error(f"start_docker_containers: {e}")
+        return False
+
+
 if stop_clicked:
+    st.session_state.stop_signal.set()  # signal all background threads to exit
     with st.spinner("Clearing all blob data, draining events, and stopping containers..."):
         deleted = clear_all_blobs()
         drained = drain_stale_events()
@@ -590,8 +618,10 @@ if stop_clicked:
 
 # ---------- Start ----------
 if start_clicked and st.session_state.phase == "idle":
-    with st.spinner("Cleaning previous data..."):
+    with st.spinner("Preparing fresh run — restarting containers, clearing data, draining events..."):
+        start_docker_containers()
         clear_all_blobs()
+        drain_stale_events()
     st.session_state.results = {}
     st.session_state.images = {}
     st.session_state.point_data = {}
@@ -599,6 +629,8 @@ if start_clicked and st.session_state.phase == "idle":
     upload_state["count"] = 0
     upload_state["done"] = False
     st.session_state.threads_started = False
+    st.session_state.stop_signal = threading.Event()  # fresh signal for new threads
+    st.session_state.image_queue = queue.Queue()  # fresh queue
     st.session_state.rendered = set()
     for key, ph in cells.items():
         ph.markdown(":gray[---]")
@@ -608,16 +640,17 @@ if start_clicked and st.session_state.phase == "idle":
 if st.session_state.phase == "running":
     if not st.session_state.threads_started:
         log.info("PHASE running: starting background threads")
+        stop = st.session_state.stop_signal
         threading.Thread(target=event_listener, args=(
             st.session_state.results, st.session_state.image_queue,
-            st.session_state.counters, data_ready,
+            st.session_state.counters, data_ready, stop,
         ), daemon=True).start()
         threading.Thread(target=image_worker, args=(
             st.session_state.image_queue, st.session_state.images,
-            st.session_state.point_data, data_ready,
+            st.session_state.point_data, data_ready, stop,
         ), daemon=True).start()
-        threading.Thread(target=drip_feed, args=(upload_state, data_ready), daemon=True).start()
-        threading.Thread(target=pipeline_counter, args=(st.session_state.counters, data_ready), daemon=True).start()
+        threading.Thread(target=drip_feed, args=(upload_state, data_ready, stop), daemon=True).start()
+        threading.Thread(target=pipeline_counter, args=(st.session_state.counters, data_ready, stop), daemon=True).start()
         st.session_state.threads_started = True
 
     if "rendered" not in st.session_state:

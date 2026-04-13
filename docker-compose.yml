@@ -76,7 +76,9 @@ services:
       - PYTHONUNBUFFERED=1
 
   dashboard:
-    build: ./dashboard
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
     container_name: dashboard
     ports:
       - "8501:8501"
@@ -84,39 +86,14 @@ services:
       - metrology_net
     volumes:
       - ./simulation:/app/simulation
-    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+    command: streamlit run simulation/live_grid.py --server.port=8501 --server.address=0.0.0.0
     environment:
       - PYTHONPATH=/app
+      - EVENT_GRID_ENDPOINT=${EVENT_GRID_ENDPOINT}
       - STORAGE_ACCOUNT_URL=${STORAGE_ACCOUNT_URL}
       - AZURE_TENANT_ID=${AZURE_TENANT_ID}
       - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
       - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
-
-  gdt_evaluation:
-    build: ./microservices/gdt_evaluation
-    container_name: gdt_evaluation
-    ports:
-      - "8083:8083"
-    networks:
-      - metrology_net
-    volumes:
-      - ./microservices/gdt_evaluation:/app
-    command: uvicorn app:app --host 0.0.0.0 --port 8083
-    environment:
-      - PYTHONPATH=/app
-  
-  reporting:
-    build: ./microservices/reporting
-    container_name: reporting
-    ports:
-      - "8084:8084"
-    networks:
-      - metrology_net
-    volumes:
-      - ./microservices/reporting:/app
-    command: uvicorn app:app --host 0.0.0.0 --port 8084
-    environment:
-      - PYTHONPATH=/app
 
 
 networks:
