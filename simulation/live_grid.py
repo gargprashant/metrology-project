@@ -17,9 +17,7 @@ import json
 import time
 import random
 import threading
-import queue
 import logging
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
@@ -292,7 +290,7 @@ def drip_feed(us, signal, stop):
     for ci in range(NUM_CMMS):
         for fi in range(FEATURES_PER_CMM):
             # ~50% pass: near-zero noise passes GDT checks, high noise fails
-            sigma = random.choice([0.0001, 0.0005, 0.001, 0.002, 0.5, 0.8, 1.0, 1.5])
+            sigma = random.choice([0.0001, 0.0001, 0.0002, 0.0005, 0.5, 0.8, 1.0, 1.5])
             jobs.append((ci, fi, random.choice(ALL_SHAPES), sigma))
     random.shuffle(jobs)
 
@@ -334,7 +332,6 @@ if "phase" not in st.session_state:
     st.session_state.threads_started = False
     st.session_state.upload_state = {"count": 0, "done": False}
     st.session_state.data_ready = threading.Event()
-    st.session_state.image_queue = queue.Queue()
     st.session_state.stop_signal = threading.Event()
 
 # Convenience aliases — same object on every rerun, threads see the same instance
@@ -531,56 +528,26 @@ def update_summary():
 
 # ---------- Stop ----------
 def drain_stale_events():
-    """Acknowledge pending events so they don't pollute the next run. Single pass only."""
-    details = event_consumer.receive(max_events=100, max_wait_time=10)
-    if details:
+    """Acknowledge ALL pending events so they don't pollute the next run."""
+    total = 0
+    while True:
+        try:
+            details = event_consumer.receive(max_events=100, max_wait_time=10)
+        except Exception:
+            break
+        if not details:
+            break
         tokens = [d.broker_properties.lock_token for d in details]
         event_consumer.acknowledge(lock_tokens=tokens)
-    return len(details)
-
-
-def stop_docker_containers():
-    """Stop all microservice containers (not the dashboard) after pipeline completes."""
-    try:
-        compose_dir = os.path.join(os.path.dirname(__file__), "..")
-        result = subprocess.run(
-            ["docker", "compose", "stop",
-             "probe_compensation", "alignment", "gdt_evaluation", "reporting"],
-            cwd=compose_dir, capture_output=True, text=True, timeout=60,
-        )
-        log.info(f"stop_docker_containers: {result.stdout.strip()}")
-        if result.returncode != 0:
-            log.error(f"stop_docker_containers stderr: {result.stderr.strip()}")
-        return result.returncode == 0
-    except Exception as e:
-        log.error(f"stop_docker_containers: {e}")
-        return False
-
-
-def start_docker_containers():
-    """Start all microservice containers that may have been stopped."""
-    try:
-        compose_dir = os.path.join(os.path.dirname(__file__), "..")
-        result = subprocess.run(
-            ["docker", "compose", "start",
-             "probe_compensation", "alignment", "gdt_evaluation", "reporting"],
-            cwd=compose_dir, capture_output=True, text=True, timeout=60,
-        )
-        log.info(f"start_docker_containers: {result.stdout.strip()}")
-        if result.returncode != 0:
-            log.error(f"start_docker_containers stderr: {result.stderr.strip()}")
-        return result.returncode == 0
-    except Exception as e:
-        log.error(f"start_docker_containers: {e}")
-        return False
+        total += len(details)
+    return total
 
 
 if stop_clicked:
     st.session_state.stop_signal.set()  # signal all background threads to exit
-    with st.spinner("Clearing all blob data, draining events, and stopping containers..."):
+    with st.spinner("Stopping threads, clearing blobs, draining events..."):
         deleted = clear_all_blobs()
         drained = drain_stale_events()
-        stopped = stop_docker_containers()
     st.session_state.phase = "idle"
     st.session_state.results = {}
     st.session_state.images = {}
@@ -591,16 +558,12 @@ if stop_clicked:
     upload_state["done"] = False
     for key, ph in cells.items():
         ph.markdown(":gray[---]")
-    stop_msg = f"Cleared {deleted} blobs, drained {drained} events."
-    if stopped:
-        stop_msg += " Containers stopped."
-    summary_bar.success(f"{stop_msg} Ready for a fresh run.")
+    summary_bar.success(f"Cleared {deleted} blobs, drained {drained} events. Ready for a fresh run.")
     st.stop()
 
 # ---------- Start ----------
 if start_clicked and st.session_state.phase == "idle":
-    with st.spinner("Preparing fresh run — restarting containers, clearing data, draining events..."):
-        start_docker_containers()
+    with st.spinner("Preparing fresh run — clearing data, draining events..."):
         clear_all_blobs()
         drain_stale_events()
     st.session_state.results = {}
@@ -611,7 +574,6 @@ if start_clicked and st.session_state.phase == "idle":
     upload_state["done"] = False
     st.session_state.threads_started = False
     st.session_state.stop_signal = threading.Event()  # fresh signal for new threads
-    st.session_state.image_queue = queue.Queue()  # fresh queue
     st.session_state.rendered = set()
     for key, ph in cells.items():
         ph.markdown(":gray[---]")

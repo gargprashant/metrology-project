@@ -1,0 +1,41 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "docker-compose-all",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": ["compose", "up", "--build", "-d"],
+      "port": 8501
+    },
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "streamlit",
+      "runtimeArgs": ["run", "simulation/live_grid.py", "--server.port=8501", "--server.address=0.0.0.0"],
+      "port": 8501
+    },
+    {
+      "name": "probe-compensation",
+      "runtimeExecutable": "uvicorn",
+      "runtimeArgs": ["app:app", "--host", "0.0.0.0", "--port", "8080"],
+      "port": 8080
+    },
+    {
+      "name": "alignment",
+      "runtimeExecutable": "uvicorn",
+      "runtimeArgs": ["app:app", "--host", "0.0.0.0", "--port", "8081"],
+      "port": 8081
+    },
+    {
+      "name": "gdt-evaluation",
+      "runtimeExecutable": "uvicorn",
+      "runtimeArgs": ["app:app", "--host", "0.0.0.0", "--port", "8083"],
+      "port": 8083
+    },
+    {
+      "name": "reporting",
+      "runtimeExecutable": "uvicorn",
+      "runtimeArgs": ["app:app", "--host", "0.0.0.0", "--port", "8084"],
+      "port": 8084
+    }
+  ]
+}
