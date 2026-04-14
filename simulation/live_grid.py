@@ -172,11 +172,14 @@ def event_listener(results, img_store, pt_store, counters, signal, stop):
 
                 ack_tokens.append(token)
 
-                # Fetch plot data and render image
+                # Fetch plot data — all 3 blobs in parallel
                 cmm_id = f"CMM_{str(ci+1).zfill(2)}"
                 scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
-                raw = read_blob("rawscan", scan_name)
-                aligned = read_blob("aligned", scan_name)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    raw_future = pool.submit(read_blob, "rawscan", scan_name)
+                    aligned_future = pool.submit(read_blob, "aligned", scan_name)
+                    raw = raw_future.result()
+                    aligned = aligned_future.result()
                 nom = raw.get("nominalPoints", []) if raw else []
                 act = aligned.get("alignedPoints", []) if aligned else []
                 pt_store[key] = (nom, act)
