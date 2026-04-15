@@ -143,75 +143,55 @@ def pipeline_counter(counters, signal, stop):
 
 # ---------- Event Listener (background thread) ----------
 
-def _process_event(detail, results, img_store, pt_store, counters, signal):
-    """Process a single event: fetch blobs, render image, update state.
-    Runs in a thread pool worker — I/O-bound blob reads run in parallel."""
-    blob_name = extract_blob_name(detail.event)
-    token = detail.broker_properties.lock_token
-    if not blob_name:
-        return token, True  # ack, nothing to do
-
-    key = parse_key(blob_name)
-    if key is None or key in results:
-        return token, True  # ack, already processed
-
-    ci, fi = key
-    log.info(f"event_listener: processing {blob_name}")
-
-    report = read_blob("reports", blob_name)
-    if not report:
-        log.warning(f"event_listener: report not found: {blob_name} — will redeliver")
-        return token, False  # do NOT ack — let it redeliver
-
-    cmm_id = f"CMM_{str(ci+1).zfill(2)}"
-    scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
-    raw = read_blob("rawscan", scan_name)
-    aligned = read_blob("aligned", scan_name)
-    nom = raw.get("nominalPoints", []) if raw else []
-    act = aligned.get("alignedPoints", []) if aligned else []
-    pt_store[key] = (nom, act)
-    if nom or act:
-        img_store[key] = make_static_3d(nom, act)
-
-    results[key] = report
-    counters["events"] += 1
-    p = report.get("summary", {}).get("passed", 0)
-    t = report.get("summary", {}).get("total_checks", 0)
-    if p == t:
-        counters["pass"] += 1
-    else:
-        counters["fail"] += 1
-    signal.set()
-    return token, True  # ack
-
-
 def event_listener(results, img_store, pt_store, counters, signal, stop):
-    """Single receiver thread: fetches batches of 20, dispatches each event
-    to a ThreadPoolExecutor (20 workers) for parallel blob reads."""
+    """Single receiver thread: fetches batches of 20 events and processes serially."""
     log.info("event_listener: STARTED")
-    with ThreadPoolExecutor(max_workers=20) as pool:
-        while not stop.is_set():
-            try:
-                details_list = event_consumer.receive(max_events=20, max_wait_time=10)
-                if not details_list:
+    while not stop.is_set():
+        try:
+            details_list = event_consumer.receive(max_events=20, max_wait_time=10)
+            if not details_list:
+                continue
+            ack_tokens = []
+            for detail in details_list:
+                blob_name = extract_blob_name(detail.event)
+                token = detail.broker_properties.lock_token
+                if not blob_name:
+                    ack_tokens.append(token)
                     continue
-                futures = [
-                    pool.submit(_process_event, d, results, img_store, pt_store, counters, signal)
-                    for d in details_list
-                ]
-                ack_tokens = []
-                for f in futures:
-                    try:
-                        token, should_ack = f.result()
-                        if should_ack:
-                            ack_tokens.append(token)
-                    except Exception as e:
-                        log.error(f"event_listener: worker error: {e}")
-                if ack_tokens:
-                    event_consumer.acknowledge(lock_tokens=ack_tokens)
-            except Exception as e:
-                log.error(f"event_listener: error: {e}")
-                time.sleep(2)
+                key = parse_key(blob_name)
+                if key is None or key in results:
+                    ack_tokens.append(token)
+                    continue
+                ci, fi = key
+                log.info(f"event_listener: processing {blob_name}")
+                report = read_blob("reports", blob_name)
+                if not report:
+                    log.warning(f"event_listener: report not found: {blob_name} — will redeliver")
+                    continue  # do NOT ack — let it redeliver
+                cmm_id = f"CMM_{str(ci+1).zfill(2)}"
+                scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
+                raw = read_blob("rawscan", scan_name)
+                aligned = read_blob("aligned", scan_name)
+                nom = raw.get("nominalPoints", []) if raw else []
+                act = aligned.get("alignedPoints", []) if aligned else []
+                pt_store[key] = (nom, act)
+                if nom or act:
+                    img_store[key] = make_static_3d(nom, act)
+                results[key] = report
+                counters["events"] += 1
+                p = report.get("summary", {}).get("passed", 0)
+                t = report.get("summary", {}).get("total_checks", 0)
+                if p == t:
+                    counters["pass"] += 1
+                else:
+                    counters["fail"] += 1
+                signal.set()
+                ack_tokens.append(token)
+            if ack_tokens:
+                event_consumer.acknowledge(lock_tokens=ack_tokens)
+        except Exception as e:
+            log.error(f"event_listener: error: {e}")
+            time.sleep(2)
     log.info("event_listener: STOPPED")
 
 
