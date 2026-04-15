@@ -304,7 +304,7 @@ def drip_feed(us, signal, stop):
             log.info(f"drip_feed: uploaded {us['count']}/100")
         except Exception as e:
             log.error(f"drip_feed: upload error: {e}")
-        time.sleep(random.uniform(0.05, 0.3))
+        time.sleep(random.uniform(0.01, 0.05))
 
     us["done"] = True
     signal.set()
