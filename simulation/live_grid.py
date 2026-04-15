@@ -42,7 +42,7 @@ import feature_generator
 
 # ---------- Config ----------
 
-NUM_CMMS = 10
+NUM_CMMS = 50
 FEATURES_PER_CMM = 10
 CONTAINERS = ["rawscan", "compensated", "aligned", "results", "reports"]
 ALL_SHAPES = ["cylinder", "sphere", "cone", "circle", "taper"]
