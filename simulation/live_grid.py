@@ -149,7 +149,7 @@ def event_listener(results, img_store, pt_store, counters, signal, stop):
     log.info("event_listener: STARTED")
     while not stop.is_set():
         try:
-            details_list = event_consumer.receive(max_events=1, max_wait_time=10)
+            details_list = event_consumer.receive(max_events=20, max_wait_time=10)
             ack_tokens = []
             for detail in details_list:
                 blob_name = extract_blob_name(detail.event)
