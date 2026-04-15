@@ -168,15 +168,6 @@ def event_listener(results, img_store, pt_store, counters, signal, stop):
                 if not report:
                     log.warning(f"event_listener: report not found: {blob_name} — will redeliver")
                     continue  # do NOT ack — let it redeliver
-                cmm_id = f"CMM_{str(ci+1).zfill(2)}"
-                scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
-                raw = read_blob("rawscan", scan_name)
-                aligned = read_blob("aligned", scan_name)
-                nom = raw.get("nominalPoints", []) if raw else []
-                act = aligned.get("alignedPoints", []) if aligned else []
-                pt_store[key] = (nom, act)
-                if nom or act:
-                    img_store[key] = make_static_3d(nom, act)
                 results[key] = report
                 counters["events"] += 1
                 p = report.get("summary", {}).get("passed", 0)
@@ -467,7 +458,6 @@ def render_cell(placeholder, ci, fi):
     failed = total_checks - passed
     label = f"PASS {passed}/{total_checks}" if all_pass else f"FAIL {failed}/{total_checks}"
 
-    img = st.session_state.images.get(key)
     with placeholder.container():
         st.markdown(
             f'<div style="background:{color};color:white;padding:6px 8px;'
@@ -479,17 +469,25 @@ def render_cell(placeholder, ci, fi):
             f'{detail_html}</div>',
             unsafe_allow_html=True,
         )
-        if img:
-            st.image(img, width="stretch")
-            with st.popover("3D"):
-                nom, act = st.session_state.point_data.get(key, ([], []))
+        with st.popover("3D"):
+            nom, act = st.session_state.point_data.get(key, ([], []))
+            if not nom and not act:
+                cmm_label = f"CMM_{str(ci+1).zfill(2)}"
+                feat_label = f"F{str(fi+1).zfill(2)}"
+                scan_name = f"{cmm_label}_{feat_label}.json"
+                raw = read_blob("rawscan", scan_name)
+                aligned_data = read_blob("aligned", scan_name)
+                nom = raw.get("nominalPoints", []) if raw else []
+                act = aligned_data.get("alignedPoints", []) if aligned_data else []
                 if nom or act:
-                    st.plotly_chart(
-                        make_interactive_3d(nom, act, f"CMM_{str(ci+1).zfill(2)} / F{str(fi+1).zfill(2)}"),
-                        key=f"plotly3d_{ci}_{fi}",
-                    )
-                else:
-                    st.info("Point data not available.")
+                    st.session_state.point_data[key] = (nom, act)
+            if nom or act:
+                st.plotly_chart(
+                    make_interactive_3d(nom, act, f"CMM_{str(ci+1).zfill(2)} / F{str(fi+1).zfill(2)}"),
+                    key=f"plotly3d_{ci}_{fi}",
+                )
+            else:
+                st.info("Point data not available.")
 
 
 def update_summary():
@@ -639,10 +637,9 @@ if st.session_state.phase == "running":
         for key, ph in cells.items():
             ci, fi = key
             result = st.session_state.results.get(key)
-            img_ready = key in st.session_state.images
             already = key in st.session_state.rendered
 
-            if isinstance(result, dict) and img_ready and not already:
+            if isinstance(result, dict) and not already:
                 render_cell(ph, ci, fi)
                 st.session_state.rendered.add(key)
             elif result == "pending" and not already:
