@@ -143,62 +143,76 @@ def pipeline_counter(counters, signal, stop):
 
 # ---------- Event Listener (background thread) ----------
 
+def _process_event(detail, results, img_store, pt_store, counters, signal):
+    """Process a single event: fetch blobs, render image, update state.
+    Runs in a thread pool worker — I/O-bound blob reads run in parallel."""
+    blob_name = extract_blob_name(detail.event)
+    token = detail.broker_properties.lock_token
+    if not blob_name:
+        return token, True  # ack, nothing to do
+
+    key = parse_key(blob_name)
+    if key is None or key in results:
+        return token, True  # ack, already processed
+
+    ci, fi = key
+    log.info(f"event_listener: processing {blob_name}")
+
+    report = read_blob("reports", blob_name)
+    if not report:
+        log.warning(f"event_listener: report not found: {blob_name} — will redeliver")
+        return token, False  # do NOT ack — let it redeliver
+
+    cmm_id = f"CMM_{str(ci+1).zfill(2)}"
+    scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
+    raw = read_blob("rawscan", scan_name)
+    aligned = read_blob("aligned", scan_name)
+    nom = raw.get("nominalPoints", []) if raw else []
+    act = aligned.get("alignedPoints", []) if aligned else []
+    pt_store[key] = (nom, act)
+    if nom or act:
+        img_store[key] = make_static_3d(nom, act)
+
+    results[key] = report
+    counters["events"] += 1
+    p = report.get("summary", {}).get("passed", 0)
+    t = report.get("summary", {}).get("total_checks", 0)
+    if p == t:
+        counters["pass"] += 1
+    else:
+        counters["fail"] += 1
+    signal.set()
+    return token, True  # ack
+
+
 def event_listener(results, img_store, pt_store, counters, signal, stop):
-    """Receive events → fetch report + plot data → render image → signal UI.
-    Each cell appears complete (result + plot) in one shot."""
+    """Single receiver thread: fetches batches of 20, dispatches each event
+    to a ThreadPoolExecutor (20 workers) for parallel blob reads."""
     log.info("event_listener: STARTED")
-    while not stop.is_set():
-        try:
-            details_list = event_consumer.receive(max_events=20, max_wait_time=10)
-            ack_tokens = []
-            for detail in details_list:
-                blob_name = extract_blob_name(detail.event)
-                token = detail.broker_properties.lock_token
-                if not blob_name:
-                    ack_tokens.append(token)
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        while not stop.is_set():
+            try:
+                details_list = event_consumer.receive(max_events=20, max_wait_time=10)
+                if not details_list:
                     continue
-
-                key = parse_key(blob_name)
-                if key is None or key in results:
-                    ack_tokens.append(token)
-                    continue
-                ci, fi = key
-                log.info(f"event_listener: processing {blob_name}")
-
-                report = read_blob("reports", blob_name)
-                if not report:
-                    log.warning(f"event_listener: report not found: {blob_name} — skipping ack, will redeliver")
-                    continue
-
-                ack_tokens.append(token)
-
-                # Fetch plot data and render image
-                cmm_id = f"CMM_{str(ci+1).zfill(2)}"
-                scan_name = f"{cmm_id}_F{str(fi+1).zfill(2)}.json"
-                raw = read_blob("rawscan", scan_name)
-                aligned = read_blob("aligned", scan_name)
-                nom = raw.get("nominalPoints", []) if raw else []
-                act = aligned.get("alignedPoints", []) if aligned else []
-                pt_store[key] = (nom, act)
-                if nom or act:
-                    img_store[key] = make_static_3d(nom, act)
-
-                # Store result and update counters
-                results[key] = report
-                counters["events"] += 1
-                p = report.get("summary", {}).get("passed", 0)
-                t = report.get("summary", {}).get("total_checks", 0)
-                if p == t:
-                    counters["pass"] += 1
-                else:
-                    counters["fail"] += 1
-                signal.set()  # wake UI — result + plot ready together
-
-            if ack_tokens:
-                event_consumer.acknowledge(lock_tokens=ack_tokens)
-        except Exception as e:
-            log.error(f"event_listener: error: {e}")
-            time.sleep(2)
+                futures = [
+                    pool.submit(_process_event, d, results, img_store, pt_store, counters, signal)
+                    for d in details_list
+                ]
+                ack_tokens = []
+                for f in futures:
+                    try:
+                        token, should_ack = f.result()
+                        if should_ack:
+                            ack_tokens.append(token)
+                    except Exception as e:
+                        log.error(f"event_listener: worker error: {e}")
+                if ack_tokens:
+                    event_consumer.acknowledge(lock_tokens=ack_tokens)
+            except Exception as e:
+                log.error(f"event_listener: error: {e}")
+                time.sleep(2)
+    log.info("event_listener: STOPPED")
 
 
 
@@ -619,12 +633,11 @@ if st.session_state.phase == "running":
     if not st.session_state.threads_started:
         log.info("PHASE running: starting background threads")
         stop = st.session_state.stop_signal
-        for _ in range(4):
-            threading.Thread(target=event_listener, args=(
-                st.session_state.results, st.session_state.images,
-                st.session_state.point_data,
-                st.session_state.counters, data_ready, stop,
-            ), daemon=True).start()
+        threading.Thread(target=event_listener, args=(
+            st.session_state.results, st.session_state.images,
+            st.session_state.point_data,
+            st.session_state.counters, data_ready, stop,
+        ), daemon=True).start()
         threading.Thread(target=drip_feed, args=(upload_state, data_ready, stop), daemon=True).start()
         threading.Thread(target=pipeline_counter, args=(st.session_state.counters, data_ready, stop), daemon=True).start()
         st.session_state.threads_started = True
