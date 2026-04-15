@@ -619,11 +619,12 @@ if st.session_state.phase == "running":
     if not st.session_state.threads_started:
         log.info("PHASE running: starting background threads")
         stop = st.session_state.stop_signal
-        threading.Thread(target=event_listener, args=(
-            st.session_state.results, st.session_state.images,
-            st.session_state.point_data,
-            st.session_state.counters, data_ready, stop,
-        ), daemon=True).start()
+        for _ in range(4):
+            threading.Thread(target=event_listener, args=(
+                st.session_state.results, st.session_state.images,
+                st.session_state.point_data,
+                st.session_state.counters, data_ready, stop,
+            ), daemon=True).start()
         threading.Thread(target=drip_feed, args=(upload_state, data_ready, stop), daemon=True).start()
         threading.Thread(target=pipeline_counter, args=(st.session_state.counters, data_ready, stop), daemon=True).start()
         st.session_state.threads_started = True
